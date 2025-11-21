@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import math
+import socket
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -64,6 +65,8 @@ class MissionConfig:
     connection_timeout: float
     readiness_timeout: float
     takeoff_delay: float
+    vis_collector_host: str
+    vis_collector_port: int
 
 
 @dataclass
@@ -366,6 +369,9 @@ async def run_mission(config: MissionConfig) -> None:
         swarm_snapshot = comm.get_swarm_snapshot()
         voronoi_polygon = compute_voronoi_cell(config, swarm_snapshot, logger)
         centroid_latlon, centroid_local = determine_centroid(voronoi_polygon, config, logger)
+        cell_area = float(voronoi_polygon.area)
+        logger.info("Voronoi cell area ≈ %.1f m^2.", cell_area)
+        send_voronoi_cell_to_collector(voronoi_polygon, centroid_local, cell_area, config, logger)
 
         waypoints_latlon = await execute_search_mode(
             drone=drone,
@@ -466,18 +472,18 @@ def compute_voronoi_cell(
         )
 
     if not sites:
-        logger.warning("No fresh swarm data available for Voronoi. Using bounding square.")
-        return box(-config.search_radius, -config.search_radius, config.search_radius, config.search_radius)
+        logger.warning("No fresh swarm data available for Voronoi. Using circular search region.")
+        return Point(0.0, 0.0).buffer(config.search_radius, resolution=128)
 
     if len(sites) == 1:
-        logger.warning("Only one site available. Assigning entire bounding square.")
-        return box(-config.search_radius, -config.search_radius, config.search_radius, config.search_radius)
+        logger.warning("Only one site available. Assigning entire circular search region.")
+        return Point(0.0, 0.0).buffer(config.search_radius, resolution=128)
 
     sites_array = np.array(sites)
     vor = Voronoi(sites_array)
 
     regions, vertices = voronoi_finite_polygons_2d(vor, radius=config.search_radius * 4.0)
-    bounding_poly = box(-config.search_radius, -config.search_radius, config.search_radius, config.search_radius)
+    bounding_poly = Point(0.0, 0.0).buffer(config.search_radius, resolution=128)
     polygons: Dict[int, Polygon] = {}
 
     for site_index, region in enumerate(regions):
@@ -490,27 +496,19 @@ def compute_voronoi_cell(
         clipped = poly.intersection(bounding_poly)
         if clipped.is_empty:
             continue
-        if isinstance(clipped, Polygon):
-            polygons[site_index] = clipped
-        else:
-            merged = unary_union(clipped)
-            if isinstance(merged, Polygon):
-                polygons[site_index] = merged
-            else:
-                for geom in merged.geoms:
-                    if isinstance(geom, Polygon):
-                        polygons[site_index] = geom
-                        break
+        polygon_candidate = _largest_polygon(clipped)
+        if polygon_candidate is not None:
+            polygons[site_index] = polygon_candidate
 
     try:
         own_index = site_ids.index(config.drone_id)
     except ValueError:
-        logger.warning("This drone ID not present in Voronoi sites. Using bounding square.")
+        logger.warning("This drone ID not present in Voronoi sites. Using circular search region.")
         return bounding_poly
 
     polygon = polygons.get(own_index)
     if polygon is None or polygon.is_empty:
-        logger.warning("Voronoi polygon empty. Using bounding square.")
+        logger.warning("Voronoi polygon empty. Using circular search region.")
         return bounding_poly
 
     logger.info(
@@ -697,6 +695,52 @@ async def goto_waypoint_and_wait(
     )
 
 
+def send_voronoi_cell_to_collector(
+    polygon: Polygon,
+    centroid_local: Tuple[float, float],
+    cell_area: float,
+    config: MissionConfig,
+    logger: DroneLoggerAdapter,
+) -> None:
+    """Send Voronoi polygon vertices to the visualization collector via UDP."""
+
+    if polygon.is_empty:
+        logger.warning("No Voronoi cell available – skipping collector send.")
+        return
+
+    vertices = list(polygon.exterior.coords)
+    if not vertices:
+        logger.warning("Voronoi polygon has no vertices – skipping collector send.")
+        return
+
+    payload = {
+        "type": "voronoi_cell",
+        "drone_id": config.drone_id,
+        "target_lat": config.target_lat,
+        "target_lon": config.target_lon,
+        "search_radius": config.search_radius,
+        "vertices_xy": [[float(x), float(y)] for x, y in vertices],
+        "centroid_xy": [float(centroid_local[0]), float(centroid_local[1])],
+        "mode": config.search_mode,
+        "cell_area_m2": cell_area,
+        "timestamp": time.time(),
+    }
+
+    message = json.dumps(payload).encode("utf-8")
+    address = (config.vis_collector_host, config.vis_collector_port)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message, address)
+        logger.info(
+            "Sending Voronoi cell to collector host=%s port=%d, vertices=%d",
+            config.vis_collector_host,
+            config.vis_collector_port,
+            len(vertices),
+        )
+    except OSError as exc:
+        logger.warning("Failed to send Voronoi cell to collector: %s", exc)
+
+
 def generate_lawnmower_path(polygon: Polygon, spacing: float) -> List[Tuple[float, float]]:
     """Generate a simple axis-aligned lawn-mower path for the polygon."""
 
@@ -760,6 +804,21 @@ def extract_lines(geom) -> List[Iterable[Tuple[float, float]]]:
         return [g.coords for g in geom.geoms if isinstance(g, LineString)]
     except AttributeError:
         return []
+
+
+def _largest_polygon(geometry) -> Optional[Polygon]:
+    """Return the largest Polygon component within a geometry."""
+
+    if geometry is None or geometry.is_empty:
+        return None
+    if isinstance(geometry, Polygon):
+        return geometry
+    if hasattr(geometry, "geoms"):
+        polygons = [g for g in geometry.geoms if isinstance(g, Polygon) and not g.is_empty]
+        if not polygons:
+            return None
+        return max(polygons, key=lambda g: g.area)
+    return None
 
 
 def latlon_to_local_xy(lat: float, lon: float, lat0: float, lon0: float) -> Tuple[float, float]:
@@ -1053,6 +1112,18 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         help="Angular increment (radians) between spiral waypoints.",
     )
     parser.add_argument(
+        "--vis-collector-host",
+        type=str,
+        default="127.0.0.1",
+        help="Host/IP for Voronoi visualization collector.",
+    )
+    parser.add_argument(
+        "--vis-collector-port",
+        type=int,
+        default=62000,
+        help="UDP port for Voronoi visualization collector.",
+    )
+    parser.add_argument(
         "--takeoff-delay",
         type=float,
         default=None,
@@ -1115,6 +1186,8 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         connection_timeout=args.connection_timeout,
         readiness_timeout=args.readiness_timeout,
         takeoff_delay=takeoff_delay,
+        vis_collector_host=args.vis_collector_host,
+        vis_collector_port=args.vis_collector_port,
     )
 
 
