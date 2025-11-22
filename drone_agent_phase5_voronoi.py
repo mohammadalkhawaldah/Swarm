@@ -69,6 +69,8 @@ class MissionConfig:
     vis_collector_port: int
     cell_size: float
     grid_origin: Tuple[float, float] = (0.0, 0.0)
+    coordinator_port: int = 61000
+    coordinator_host: str = "127.0.0.1"
 
 
 @dataclass
@@ -91,6 +93,8 @@ class DroneState:
     heading_deg: float
     timestamp: float
     received_time: float
+    x_local: float = 0.0
+    y_local: float = 0.0
 
 
 class SwarmReceiverProtocol(asyncio.DatagramProtocol):
@@ -114,6 +118,9 @@ class SwarmComm:
         logger: DroneLoggerAdapter,
         broadcast_interval: float = 0.5,
         summary_interval: float = 5.0,
+        assignment_callback: Optional[callable] = None,
+        coordinator_host: str = "127.0.0.1",
+        coordinator_port: int = 61000,
     ):
         self.drone_id = drone_id
         self.swarm_size = swarm_size
@@ -129,6 +136,9 @@ class SwarmComm:
         self._stop_event = asyncio.Event()
         self._current_state: Optional[DroneState] = None
         self._coverage_updates: List[Tuple[int, int]] = []
+        self._assignment_callback = assignment_callback
+        self._coord_host = coordinator_host
+        self._coord_port = coordinator_port
 
     async def start(self) -> None:
         """Create the UDP listener and spawn broadcaster/summary tasks."""
@@ -188,19 +198,25 @@ class SwarmComm:
 
         try:
             payload = json.loads(data.decode("utf-8"))
-            sender_id = int(payload["drone_id"])
-            if sender_id == self.drone_id:
-                return
-            state = DroneState(
-                drone_id=sender_id,
-                lat=float(payload["lat"]),
-                lon=float(payload["lon"]),
-                alt_amsl=float(payload["alt_amsl"]),
-                heading_deg=float(payload["heading_deg"]),
-                timestamp=float(payload["timestamp"]),
-                received_time=time.time(),
-            )
-            self.swarm_state[sender_id] = state
+            msg_type = payload.get("msg_type") or payload.get("type") or "state"
+            if msg_type == "state":
+                sender_id = int(payload["drone_id"])
+                if sender_id == self.drone_id:
+                    return
+                state = DroneState(
+                    drone_id=sender_id,
+                    lat=float(payload["lat"]),
+                    lon=float(payload["lon"]),
+                    alt_amsl=float(payload["alt_amsl"]),
+                    heading_deg=float(payload["heading_deg"]),
+                    timestamp=float(payload["timestamp"]),
+                    received_time=time.time(),
+                    x_local=float(payload.get("x_local", 0.0)),
+                    y_local=float(payload.get("y_local", 0.0)),
+                )
+                self.swarm_state[sender_id] = state
+            elif msg_type == "region_assignment" and self._assignment_callback:
+                self._assignment_callback(payload)
         except Exception as exc:
             self.logger.debug("Failed to parse swarm packet from %s: %s", addr, exc)
 
@@ -213,12 +229,15 @@ class SwarmComm:
                 if state and self._listen_transport:
                     message = json.dumps(
                         {
+                            "msg_type": "state",
                             "drone_id": state.drone_id,
                             "lat": state.lat,
                             "lon": state.lon,
                             "alt_amsl": state.alt_amsl,
                             "heading_deg": state.heading_deg,
                             "timestamp": state.timestamp,
+                            "x_local": state.x_local,
+                            "y_local": state.y_local,
                         }
                     ).encode("utf-8")
                     for peer_id in range(1, self.swarm_size + 1):
@@ -226,6 +245,8 @@ class SwarmComm:
                             continue
                         peer_port = self.base_port + peer_id
                         self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
+                    if self._coord_port:
+                        self._listen_transport.sendto(message, (self._coord_host, self._coord_port))
                 if self._coverage_updates:
                     message = json.dumps(
                         {
@@ -239,6 +260,8 @@ class SwarmComm:
                             continue
                         peer_port = self.base_port + peer_id
                         self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
+                    if self._coord_port:
+                        self._listen_transport.sendto(message, (self._coord_host, self._coord_port))
                     self._coverage_updates.clear()
                 await asyncio.sleep(self.broadcast_interval)
         except asyncio.CancelledError:
@@ -298,7 +321,7 @@ async def connect_and_prepare(config: MissionConfig, logger: DroneLoggerAdapter)
     return drone, home_pos
 
 
-async def start_local_state_updates(drone: System, comm: SwarmComm) -> list[asyncio.Task]:
+async def start_local_state_updates(drone: System, comm: SwarmComm, config: MissionConfig) -> list[asyncio.Task]:
     """Spawn telemetry listeners that keep the latest local state updated for broadcasting."""
 
     tasks: list[asyncio.Task] = []
@@ -314,6 +337,12 @@ async def start_local_state_updates(drone: System, comm: SwarmComm) -> list[asyn
     async def position_worker():
         try:
             async for position in drone.telemetry.position():
+                x_local, y_local = latlon_to_local_xy(
+                    position.latitude_deg,
+                    position.longitude_deg,
+                    config.target_lat,
+                    config.target_lon,
+                )
                 state = DroneState(
                     drone_id=comm.drone_id,
                     lat=position.latitude_deg,
@@ -322,6 +351,8 @@ async def start_local_state_updates(drone: System, comm: SwarmComm) -> list[asyn
                     heading_deg=heading_holder["value"],
                     timestamp=time.time(),
                     received_time=time.time(),
+                    x_local=x_local,
+                    y_local=y_local,
                 )
                 comm.update_local_state(state)
         except asyncio.CancelledError:
@@ -339,9 +370,65 @@ async def run_mission(config: MissionConfig) -> None:
     log_configuration(config, logger)
     drone, home_pos = await connect_and_prepare(config, logger)
 
-    comm = SwarmComm(config.drone_id, config.swarm_size, config.swarm_broadcast_port_base, logger)
+    assignment_holder: Dict[str, Optional[RegionAssignment]] = {"assignment": None}
+
+    def handle_assignment(payload: dict) -> None:
+        try:
+            target_id = int(payload.get("drone_id"))
+        except (TypeError, ValueError):
+            return
+        if target_id != config.drone_id:
+            return
+        cells_raw = payload.get("cells") or []
+        parsed_cells: List[Tuple[int, int]] = []
+        for cell in cells_raw:
+            try:
+                ix, iy = int(cell[0]), int(cell[1])
+                parsed_cells.append((ix, iy))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not parsed_cells:
+            logger.warning("Received region assignment with no valid cells.")
+            return
+        origin_xy = payload.get("origin_xy") or [0.0, 0.0]
+        try:
+            origin_x = float(origin_xy[0])
+            origin_y = float(origin_xy[1])
+        except (TypeError, ValueError, IndexError):
+            origin_x = origin_y = 0.0
+        try:
+            cell_size = float(payload.get("cell_size", config.cell_size))
+        except (TypeError, ValueError):
+            cell_size = config.cell_size
+
+        assignment_holder["assignment"] = RegionAssignment(
+            origin_xy=(origin_x, origin_y),
+            cell_size=cell_size,
+            cells=parsed_cells,
+            received_time=time.time(),
+        )
+        ix_vals = [c[0] for c in parsed_cells]
+        iy_vals = [c[1] for c in parsed_cells]
+        logger.info(
+            "Received region assignment: %d cells (ix range %d-%d, iy range %d-%d).",
+            len(parsed_cells),
+            min(ix_vals),
+            max(ix_vals),
+            min(iy_vals),
+            max(iy_vals),
+        )
+
+    comm = SwarmComm(
+        config.drone_id,
+        config.swarm_size,
+        config.swarm_broadcast_port_base,
+        logger,
+        assignment_callback=handle_assignment,
+        coordinator_host=config.coordinator_host,
+        coordinator_port=config.coordinator_port,
+    )
     await comm.start()
-    telem_tasks = await start_local_state_updates(drone, comm)
+    telem_tasks = await start_local_state_updates(drone, comm, config)
 
     search_alt_amsl = home_pos.altitude_m + config.target_alt_agl
 
@@ -393,23 +480,40 @@ async def run_mission(config: MissionConfig) -> None:
         logger.info("Reached assigned V-waypoint. Holding for %.1f seconds.", config.initial_loiter_seconds)
         await asyncio.sleep(config.initial_loiter_seconds)
 
-        await wait_for_voronoi_data(comm, config, logger)
-        swarm_snapshot = comm.get_swarm_snapshot()
-        voronoi_polygon = compute_voronoi_cell(config, swarm_snapshot, logger)
-        centroid_latlon, centroid_local = determine_centroid(voronoi_polygon, config, logger)
-        cell_area = float(voronoi_polygon.area)
-        logger.info("Voronoi cell area ≈ %.1f m^2.", cell_area)
-        send_voronoi_cell_to_collector(voronoi_polygon, centroid_local, cell_area, config, logger)
+        waypoints_latlon: List[Tuple[float, float]] = []
+        assignment = assignment_holder.get("assignment")
+        if assignment and assignment.cells:
+            logger.info(
+                "Executing assigned grid search with %d cells (cell_size=%.1f m).",
+                len(assignment.cells),
+                assignment.cell_size,
+            )
+            waypoints_latlon = await execute_assigned_region_search(
+                drone=drone,
+                config=config,
+                assignment=assignment,
+                search_alt_amsl=search_alt_amsl,
+                logger=logger,
+            )
+        else:
+            logger.warning("No region assignment received before search. Falling back to Voronoi partition.")
+            await wait_for_voronoi_data(comm, config, logger)
+            swarm_snapshot = comm.get_swarm_snapshot()
+            voronoi_polygon = compute_voronoi_cell(config, swarm_snapshot, logger)
+            centroid_latlon, centroid_local = determine_centroid(voronoi_polygon, config, logger)
+            cell_area = float(voronoi_polygon.area)
+            logger.info("Voronoi cell area ≈ %.1f m^2.", cell_area)
+            send_voronoi_cell_to_collector(voronoi_polygon, centroid_local, cell_area, config, logger)
 
-        waypoints_latlon = await execute_search_mode(
-            drone=drone,
-            config=config,
-            centroid_latlon=centroid_latlon,
-            centroid_local=centroid_local,
-            polygon=voronoi_polygon,
-            search_alt_amsl=search_alt_amsl,
-            logger=logger,
-        )
+            waypoints_latlon = await execute_search_mode(
+                drone=drone,
+                config=config,
+                centroid_latlon=centroid_latlon,
+                centroid_local=centroid_local,
+                polygon=voronoi_polygon,
+                search_alt_amsl=search_alt_amsl,
+                logger=logger,
+            )
 
         logger.info("Search pattern complete. Landing.")
         await drone.action.land()
@@ -821,6 +925,110 @@ def generate_spiral_path(
     return path
 
 
+def convert_cells_to_local_points(
+    cells: List[Tuple[int, int]],
+    origin_xy: Tuple[float, float],
+    cell_size: float,
+) -> List[Tuple[int, int, float, float]]:
+    """Convert grid indices to local XY centers."""
+
+    ox, oy = origin_xy
+    points: List[Tuple[int, int, float, float]] = []
+    for ix, iy in cells:
+        x = ox + (ix + 0.5) * cell_size
+        y = oy + (iy + 0.5) * cell_size
+        points.append((ix, iy, x, y))
+    return points
+
+
+def build_snake_path(points: List[Tuple[int, int, float, float]]) -> List[Tuple[int, int, float, float]]:
+    """Sort cell centers in a snake (lawn-mower) order."""
+
+    rows: Dict[int, List[Tuple[int, int, float, float]]] = {}
+    for ix, iy, x, y in points:
+        rows.setdefault(iy, []).append((ix, iy, x, y))
+
+    ordered: List[Tuple[int, int, float, float]] = []
+    for idx, (iy, row_cells) in enumerate(sorted(rows.items())):
+        row_cells.sort(key=lambda item: item[0], reverse=(idx % 2 == 1))
+        ordered.extend(row_cells)
+    return ordered
+
+
+async def goto_local_xy(
+    drone: System,
+    config: MissionConfig,
+    x_local: float,
+    y_local: float,
+    altitude_amsl: float,
+    logger: DroneLoggerAdapter,
+) -> Tuple[float, float]:
+    """Fly to a local XY point converted to lat/lon."""
+
+    lat, lon = local_xy_to_latlon(x_local, y_local, config.target_lat, config.target_lon)
+    await drone.action.goto_location(lat, lon, altitude_amsl, config.yaw_deg)
+    await _wait_until_at_position(
+        drone,
+        target_lat=lat,
+        target_lon=lon,
+        target_alt_amsl=altitude_amsl,
+        horiz_threshold_m=5.0,
+        vert_threshold_m=3.0,
+        logger=logger,
+    )
+    return lat, lon
+
+
+async def execute_assigned_region_search(
+    drone: System,
+    config: MissionConfig,
+    assignment: RegionAssignment,
+    search_alt_amsl: float,
+    logger: DroneLoggerAdapter,
+) -> List[Tuple[float, float]]:
+    """Follow the snake path defined by the coordinator assignment."""
+
+    cell_points = convert_cells_to_local_points(assignment.cells, assignment.origin_xy, assignment.cell_size)
+    if not cell_points:
+        logger.warning("Assigned region contains no valid cells.")
+        return []
+
+    centroid_x = sum(p[2] for p in cell_points) / len(cell_points)
+    centroid_y = sum(p[3] for p in cell_points) / len(cell_points)
+    logger.info("Flying to assigned centroid at local (%.1f, %.1f).", centroid_x, centroid_y)
+    await goto_local_xy(drone, config, centroid_x, centroid_y, search_alt_amsl, logger)
+
+    path = build_snake_path(cell_points)
+    logger.info("Executing snake path with %d waypoints.", len(path))
+    flown: List[Tuple[float, float]] = []
+    for ix, iy, x_local, y_local in path:
+        lat, lon = local_xy_to_latlon(x_local, y_local, config.target_lat, config.target_lon)
+        logger.info(
+            "Visiting cell (%d, %d) at lat=%.7f lon=%.7f (local %.1f, %.1f).",
+            ix,
+            iy,
+            lat,
+            lon,
+            x_local,
+            y_local,
+        )
+        await drone.action.goto_location(lat, lon, search_alt_amsl, config.yaw_deg)
+        await _wait_until_at_position(
+            drone,
+            target_lat=lat,
+            target_lon=lon,
+            target_alt_amsl=search_alt_amsl,
+            horiz_threshold_m=5.0,
+            vert_threshold_m=3.0,
+            logger=logger,
+        )
+        flown.append((lat, lon))
+
+    logger.info("Assigned region path complete. Loitering for %.1f seconds.", config.loiter_after_pattern)
+    await asyncio.sleep(config.loiter_after_pattern)
+    return flown
+
+
 def extract_lines(geom) -> List[Iterable[Tuple[float, float]]]:
     """Extract coordinate sequences from a (multi)line intersection result."""
 
@@ -888,6 +1096,14 @@ def local_xy_to_grid(x: float, y: float, cfg: GridAssignmentConfig) -> Tuple[int
 class GridAssignmentConfig:
     cell_size: float
     grid_size: Tuple[int, int]
+
+
+@dataclass
+class RegionAssignment:
+    origin_xy: Tuple[float, float]
+    cell_size: float
+    cells: List[Tuple[int, int]]
+    received_time: float
 
 
 def compute_v_formation_offset(drone_id: int) -> Tuple[float, float]:
@@ -1175,6 +1391,18 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         help="Coverage grid cell size (meters) for assignments.",
     )
     parser.add_argument(
+        "--coordinator-port",
+        type=int,
+        default=61000,
+        help="UDP port where the coverage coordinator listens for state messages.",
+    )
+    parser.add_argument(
+        "--coordinator-host",
+        type=str,
+        default="127.0.0.1",
+        help="Host/IP of the coverage coordinator listener.",
+    )
+    parser.add_argument(
         "--takeoff-delay",
         type=float,
         default=None,
@@ -1241,6 +1469,8 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         vis_collector_port=args.vis_collector_port,
         cell_size=args.grid_cell_size,
         grid_origin=(0.0, 0.0),
+        coordinator_port=args.coordinator_port,
+        coordinator_host=args.coordinator_host,
     )
 
 

@@ -39,6 +39,7 @@ class DroneInfo:
     drone_id: int
     position_xy: Tuple[float, float]
     last_seen: float
+    ready: bool = False
 
 
 class CoverageCoordinator:
@@ -53,14 +54,21 @@ class CoverageCoordinator:
         self.max_drones = args.max_drones
         self.listen_host = args.listen_host
         self.broadcast_host = args.broadcast_host
+        self.listen_port = args.listen_port
+        self.visualizer_host = args.visualizer_host
+        self.visualizer_port = args.visualizer_port
+        self.activation_radius = args.activation_radius_m
 
         self.grid_side = int(math.ceil((2 * self.search_radius) / self.cell_size))
         self.radius_sq = self.search_radius * self.search_radius
+        offset = -(self.grid_side * self.cell_size) / 2.0
+        self.grid_origin = (offset, offset)
         self.circle_cell_count = self._count_circle_cells()
 
         self.drone_infos: Dict[int, DroneInfo] = {}
         self.pending_replan = False
         self.last_replan_time = 0.0
+        self.plan_counter = 0
 
     def _count_circle_cells(self) -> int:
         count = 0
@@ -71,9 +79,8 @@ class CoverageCoordinator:
         return count
 
     def _cell_center_xy(self, ix: int, iy: int) -> Tuple[float, float]:
-        offset = -(self.grid_side * self.cell_size) / 2.0
-        x = offset + ix * self.cell_size + self.cell_size / 2.0
-        y = offset + iy * self.cell_size + self.cell_size / 2.0
+        x = self.grid_origin[0] + ix * self.cell_size + self.cell_size / 2.0
+        y = self.grid_origin[1] + iy * self.cell_size + self.cell_size / 2.0
         return x, y
 
     def _cell_inside_circle(self, ix: int, iy: int) -> bool:
@@ -84,6 +91,8 @@ class CoverageCoordinator:
         drone_id = payload.get("drone_id")
         lat = payload.get("lat")
         lon = payload.get("lon")
+        x_local = payload.get("x_local")
+        y_local = payload.get("y_local")
         if drone_id is None or lat is None or lon is None:
             return
         try:
@@ -92,13 +101,32 @@ class CoverageCoordinator:
             lon = float(lon)
         except (TypeError, ValueError):
             return
-        x, y = latlon_to_local_xy(lat, lon, self.target_lat, self.target_lon)
+        if x_local is not None and y_local is not None:
+            try:
+                x = float(x_local)
+                y = float(y_local)
+            except (TypeError, ValueError):
+                x, y = latlon_to_local_xy(lat, lon, self.target_lat, self.target_lon)
+        else:
+            x, y = latlon_to_local_xy(lat, lon, self.target_lat, self.target_lon)
         now = time.time()
+        in_activation = (x * x + y * y) <= self.activation_radius * self.activation_radius
         info = self.drone_infos.get(drone_id)
         if info is None:
-            LOGGER.info("Detected new drone %s – scheduling repartition.", drone_id)
+            LOGGER.info("Detected new drone %s.", drone_id)
+            info = DroneInfo(drone_id=drone_id, position_xy=(x, y), last_seen=now, ready=in_activation)
+            self.drone_infos[drone_id] = info
+            if in_activation:
+                LOGGER.info("  Drone %s entered search area – scheduling repartition.", drone_id)
+                self.pending_replan = True
+            return
+
+        info.position_xy = (x, y)
+        info.last_seen = now
+        if not info.ready and in_activation:
+            info.ready = True
+            LOGGER.info("Drone %s reached search area – scheduling repartition.", drone_id)
             self.pending_replan = True
-        self.drone_infos[drone_id] = DroneInfo(drone_id=drone_id, position_xy=(x, y), last_seen=now)
 
     def remove_inactive_drones(self) -> None:
         now = time.time()
@@ -121,11 +149,11 @@ class CoverageCoordinator:
         return False
 
     def compute_assignments(self) -> Dict[int, List[List[int]]]:
-        active_ids = list(self.drone_infos.keys())
+        active_ids = [did for did, info in self.drone_infos.items() if info.ready]
         if not active_ids:
             return {}
         assignments: Dict[int, List[List[int]]] = {drone_id: [] for drone_id in active_ids}
-        positions = {drone_id: info.position_xy for drone_id, info in self.drone_infos.items()}
+        positions = {drone_id: info.position_xy for drone_id, info in self.drone_infos.items() if info.ready}
 
         for ix in range(self.grid_side):
             for iy in range(self.grid_side):
@@ -146,24 +174,32 @@ class CoverageCoordinator:
         if not assignments:
             return
         loop = asyncio.get_running_loop()
+        active_ids = sorted(assignments.keys())
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
         transport, _ = await loop.create_datagram_endpoint(
             asyncio.DatagramProtocol,
             sock=sock,
         )
+        plan_id = self.plan_counter
+        self.plan_counter += 1
         try:
             for drone_id, cells in assignments.items():
                 payload = {
                     "msg_type": "region_assignment",
                     "drone_id": drone_id,
-                    "origin_xy": [0.0, 0.0],
+                    "origin_xy": list(self.grid_origin),
                     "cell_size": self.cell_size,
                     "cells": cells,
+                    "search_radius": self.search_radius,
+                    "active_ids": active_ids,
+                    "plan_id": plan_id,
                 }
                 message = json.dumps(payload).encode("utf-8")
                 dest = (self.broadcast_host, self.base_port + drone_id)
                 transport.sendto(message, dest)
+                if self.visualizer_port:
+                    transport.sendto(message, (self.visualizer_host, self.visualizer_port))
         finally:
             transport.close()
 
@@ -207,33 +243,19 @@ async def main() -> None:
     coordinator = CoverageCoordinator(args)
     loop = asyncio.get_running_loop()
 
-    transports = []
-    listen_ports = [args.mesh_base_port + i for i in range(1, args.max_drones + 1)]
-    for port in listen_ports:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
         try:
-            sock.bind((args.listen_host, port))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except OSError:
-            LOGGER.warning("Port %s:%d already in use; skipping.", args.listen_host, port)
-            continue
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: MeshProtocol(coordinator),
-            sock=sock,
-        )
-        transports.append(transport)
-    if transports:
-        LOGGER.info(
-            "Coordinator listening on %s",
-            ", ".join(f"{args.listen_host}:{port}" for port in listen_ports),
-        )
-    else:
-        LOGGER.warning("No ports could be bound; coordinator will not receive any state messages.")
+            pass
+    sock.bind((args.listen_host, args.listen_port))
+    transport, _ = await loop.create_datagram_endpoint(
+        lambda: MeshProtocol(coordinator),
+        sock=sock,
+    )
+    LOGGER.info("Coordinator listening on %s:%d", args.listen_host, args.listen_port)
 
     try:
         while True:
@@ -244,8 +266,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         LOGGER.info("Coordinator stopped by user.")
     finally:
-        for transport in transports:
-            transport.close()
+        transport.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -259,7 +280,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesh-base-port", type=int, default=61000, help="Base UDP port for swarm mesh.")
     parser.add_argument("--max-drones", type=int, default=5, help="Maximum number of drone IDs to monitor.")
     parser.add_argument("--listen-host", default="0.0.0.0", help="Host/IP to bind for listening sockets.")
+    parser.add_argument("--listen-port", type=int, default=61000, help="UDP port where coordinator listens for state messages.")
     parser.add_argument("--broadcast-host", default="127.0.0.1", help="Host/IP used when sending assignments.")
+    parser.add_argument("--visualizer-host", default="127.0.0.1", help="Host/IP for optional visualization listener.")
+    parser.add_argument("--visualizer-port", type=int, default=62000, help="UDP port for visualization listener (0 to disable).")
+    parser.add_argument(
+        "--activation-radius-m",
+        type=float,
+        default=150.0,
+        help="Distance from target before a drone participates in assignments.",
+    )
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging verbosity.")
     args = parser.parse_args()
     logging.basicConfig(

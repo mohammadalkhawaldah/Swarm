@@ -1,8 +1,13 @@
 """
 Swarm Voronoi visualizer.
 
-Listens for Voronoi cell broadcasts from Phase 5 drone agents and plots all
-cells on a shared local XY map once every expected drone has reported in.
+Listens for Voronoi/partition broadcasts from the swarm (Phase 5+):
+* Phase 5 agents send ``type = "voronoi_cell"`` with polygon vertices.
+* Phase 6 coordinator sends ``msg_type = "region_assignment"`` plus grid cells.
+
+Once every expected drone has reported in, all cells are plotted on a shared
+local XY map and coverage diagnostics are printed. The tool can optionally keep
+listening for future assignments/replans.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ from typing import Dict, Iterable, List
 
 import matplotlib.pyplot as plt
 import numpy as np
-from shapely.geometry import Point, Polygon
+from shapely.geometry import Point, Polygon, box
 from shapely.ops import unary_union
 
 
@@ -35,18 +40,18 @@ class VisualizerConfig:
 def parse_expected(expected: str) -> List[int]:
     """Parse a comma-separated list of drone IDs into sorted integers."""
 
+    if expected is None or expected.strip() == "":
+        return []
     ids = []
     for token in expected.split(","):
         token = token.strip()
         if not token:
             continue
         ids.append(int(token))
-    if not ids:
-        raise ValueError("Expected at least one drone ID in --expected-drones.")
     return sorted(set(ids))
 
 
-def plot_voronoi_cells(cells: Dict[int, dict], diag: dict | None) -> None:
+def plot_regions(polygons: Dict[int, Polygon], diag: dict | None, block_display: bool = True) -> None:
     """Plot all Voronoi cells on a shared Matplotlib figure."""
 
     fig, ax = plt.subplots()
@@ -55,25 +60,25 @@ def plot_voronoi_cells(cells: Dict[int, dict], diag: dict | None) -> None:
     gap_pct = diag.get("gap_pct") if diag else None
     overlap_pct = diag.get("overlap_pct") if diag else None
 
-    for drone_id in sorted(cells):
-        payload = cells[drone_id]
-        vertices = payload.get("vertices_xy") or []
-        centroid = payload.get("centroid_xy") or [0.0, 0.0]
-        area = payload.get("cell_area_m2")
+    for drone_id in sorted(polygons):
+        poly = polygons[drone_id]
+        if poly.is_empty:
+            continue
+        vertices = list(poly.exterior.coords)
+        centroid = (poly.centroid.x, poly.centroid.y)
+        area = poly.area
 
         if len(vertices) < 3:
             LOGGER.warning("Drone %d polygon has too few vertices (%d). Skipping plot.", drone_id, len(vertices))
             continue
 
-        xs = [p[0] for p in vertices] + [vertices[0][0]]
-        ys = [p[1] for p in vertices] + [vertices[0][1]]
+        xs = [p[0] for p in vertices]
+        ys = [p[1] for p in vertices]
         patch = ax.fill(xs, ys, alpha=0.3, label=f"Drone {drone_id}")
         edge_color = patch[0].get_facecolor()
         ax.plot(xs, ys, color=edge_color, linewidth=1.5)
         ax.plot(centroid[0], centroid[1], "ko", markersize=4)
-        label = f"{drone_id}"
-        if area is not None:
-            label += f"\n{area:.0f} m²"
+        label = f"{drone_id}\n{area:.0f} m²"
         ax.text(centroid[0], centroid[1], label, fontsize=8, ha="center", va="center")
 
     if search_radius:
@@ -90,12 +95,14 @@ def plot_voronoi_cells(cells: Dict[int, dict], diag: dict | None) -> None:
         title += f"\nCoverage={coverage_pct:.2f}%, Gaps={gap_pct:.4f}%, Overlap={overlap_pct:.4f}%"
     ax.set_title(title)
     ax.grid(True)
-    if cells:
+    if polygons:
         ax.legend(loc="upper right")
-    plt.show()
+    plt.show(block=block_display)
+    if not block_display:
+        plt.pause(0.1)
 
 
-def log_diagnostics(cells: Dict[int, dict], diag: dict | None, order: Iterable[int]) -> None:
+def log_diagnostics(polygons: Dict[int, Polygon], diag: dict | None, order: Iterable[int]) -> None:
     """Print coverage/overlap diagnostics and per-drone percentages."""
 
     if not diag:
@@ -124,83 +131,64 @@ def log_diagnostics(cells: Dict[int, dict], diag: dict | None, order: Iterable[i
     LOGGER.info("")
     LOGGER.info("Per-drone cell areas (relative to full circle):")
     for drone_id in order:
-        payload = cells.get(drone_id)
-        if payload is None:
+        poly = polygons.get(drone_id)
+        if poly is None or poly.is_empty:
             LOGGER.info("  Drone %d: no data received.", drone_id)
             continue
-        area = payload.get("cell_area_m2", 0.0) or 0.0
+        area = poly.area
         pct = 100.0 * area / circle_area if circle_area > 0 else 0.0
-        mode = payload.get("mode")
-        LOGGER.info("  Drone %d: %.1f m² (%.2f%%), mode=%s", drone_id, area, pct, mode)
+        LOGGER.info("  Drone %d: %.1f m² (%.2f%%)", drone_id, area, pct)
 
 
-def compute_diagnostics(cells: Dict[int, dict]) -> dict | None:
-    """Build Shapely polygons and compute coverage/overlap diagnostics."""
-
-    search_radius = None
-    for payload in cells.values():
-        radius = payload.get("search_radius")
-        if radius is not None:
-            search_radius = float(radius)
-            break
+def compute_diagnostics(polygons: Dict[int, Polygon], search_radius: float | None) -> dict | None:
+    """Compute coverage/overlap diagnostics for already-built polygons."""
 
     if not search_radius or search_radius <= 0:
-        LOGGER.warning("No valid search radius found in payloads; skipping diagnostics.")
+        LOGGER.warning("No valid search radius provided; skipping diagnostics.")
         return None
 
     circle_poly = Point(0.0, 0.0).buffer(search_radius, resolution=512)
     circle_area = circle_poly.area
 
-    cell_polygons: Dict[int, Polygon] = {}
-    for drone_id, payload in cells.items():
-        poly = _payload_to_polygon(drone_id, payload)
-        if poly is not None and not poly.is_empty:
-            cell_polygons[drone_id] = poly
-
-    if not cell_polygons:
-        LOGGER.warning("No valid Voronoi polygons to analyze; diagnostics will be limited.")
+    if polygons:
+        union_poly = unary_union(list(polygons.values()))
+    else:
         union_poly = Polygon()
-    else:
-        union_poly = unary_union(list(cell_polygons.values()))
 
-    if union_poly.is_empty:
-        covered_poly = Polygon()
-    else:
-        covered_poly = union_poly.intersection(circle_poly)
-
+    covered_poly = union_poly.intersection(circle_poly) if not union_poly.is_empty else Polygon()
     covered_area = covered_poly.area
     gap_area = max(circle_area - covered_area, 0.0)
 
     overlap_area = 0.0
-    items = list(cell_polygons.items())
+    items = list(polygons.items())
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
             try:
                 inter = items[i][1].intersection(items[j][1]).intersection(circle_poly)
                 overlap_area += inter.area
             except Exception as exc:
-                LOGGER.debug("Failed to compute overlap between drones %s and %s: %s", items[i][0], items[j][0], exc)
+                LOGGER.debug(
+                    "Failed to compute overlap between drones %s and %s: %s",
+                    items[i][0],
+                    items[j][0],
+                    exc,
+                )
 
-    coverage_pct = 100.0 * covered_area / circle_area if circle_area > 0 else 0.0
-    gap_pct = 100.0 * gap_area / circle_area if circle_area > 0 else 0.0
-    overlap_pct = 100.0 * overlap_area / circle_area if circle_area > 0 else 0.0
-
+    circle_inv = 1.0 / circle_area if circle_area > 0 else 0.0
     return {
         "search_radius": search_radius,
-        "circle_poly": circle_poly,
         "circle_area": circle_area,
-        "cell_polygons": cell_polygons,
         "covered_area": covered_area,
         "gap_area": gap_area,
         "overlap_area": overlap_area,
-        "coverage_pct": coverage_pct,
-        "gap_pct": gap_pct,
-        "overlap_pct": overlap_pct,
+        "coverage_pct": covered_area * circle_inv * 100.0,
+        "gap_pct": gap_area * circle_inv * 100.0,
+        "overlap_pct": overlap_area * circle_inv * 100.0,
     }
 
 
-def _payload_to_polygon(drone_id: int, payload: dict) -> Polygon | None:
-    """Convert payload vertices into a cleaned Shapely Polygon."""
+def _polygon_from_vertices(drone_id: int, payload: dict) -> Polygon | None:
+    """Convert vertex payload into a cleaned Shapely Polygon."""
 
     vertices = payload.get("vertices_xy") or []
     if len(vertices) < 3:
@@ -234,8 +222,45 @@ def _payload_to_polygon(drone_id: int, payload: dict) -> Polygon | None:
     return poly
 
 
+def _polygon_from_assignment(payload: dict) -> Polygon | None:
+    """Convert a region_assignment payload into a polygon via union of grid cells."""
+
+    origin = payload.get("origin_xy")
+    cell_size = payload.get("cell_size")
+    cells = payload.get("cells") or []
+    if origin is None or cell_size is None or not cells:
+        return None
+    try:
+        origin_x = float(origin[0])
+        origin_y = float(origin[1])
+        cell_size = float(cell_size)
+    except (TypeError, ValueError):
+        return None
+
+    boxes = []
+    for cell in cells:
+        if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+            continue
+        try:
+            ix = int(cell[0])
+            iy = int(cell[1])
+        except (TypeError, ValueError):
+            continue
+        x_min = origin_x + ix * cell_size
+        y_min = origin_y + iy * cell_size
+        boxes.append(box(x_min, y_min, x_min + cell_size, y_min + cell_size))
+
+    if not boxes:
+        return None
+    try:
+        return unary_union(boxes)
+    except Exception as exc:
+        LOGGER.warning("Failed to build polygon from assignment: %s", exc)
+        return None
+
+
 def run_visualizer(config: VisualizerConfig) -> None:
-    """Receive Voronoi cells via UDP and plot once all expected drones report in."""
+    """Receive Voronoi/assignment packets and plot using dynamic drone sets."""
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((config.listen_host, config.listen_port))
@@ -243,11 +268,14 @@ def run_visualizer(config: VisualizerConfig) -> None:
         "Listening for Voronoi cells on %s:%d (expected drones: %s)",
         config.listen_host,
         config.listen_port,
-        ", ".join(map(str, config.expected_drones)),
+        ", ".join(map(str, config.expected_drones)) if config.expected_drones else "dynamic",
     )
 
-    expected_set = set(config.expected_drones)
-    cells: Dict[int, dict] = {}
+    static_expected = set(config.expected_drones)
+    current_expected = set(static_expected)
+    current_plan_id: int | None = None
+    polygons: Dict[int, Polygon] = {}
+    latest_radius: float | None = None
 
     try:
         while True:
@@ -258,37 +286,86 @@ def run_visualizer(config: VisualizerConfig) -> None:
                 LOGGER.warning("Failed to decode JSON from %s: %s", addr, exc)
                 continue
 
-            if payload.get("type") != "voronoi_cell":
-                LOGGER.debug("Ignoring message with unexpected type from %s: %s", addr, payload.get("type"))
-                continue
-
+            msg_type = payload.get("msg_type") or payload.get("type") or ""
             drone_id = payload.get("drone_id")
             if drone_id is None:
-                LOGGER.warning("Received Voronoi payload without drone_id from %s", addr)
+                LOGGER.warning("Received payload without drone_id from %s", addr)
                 continue
 
-            vertices = payload.get("vertices_xy") or []
-            LOGGER.info(
-                "Received Voronoi cell from drone_id=%s with %d vertices (mode=%s)",
-                drone_id,
-                len(vertices),
-                payload.get("mode"),
-            )
-            cells[drone_id] = payload
+            polygon: Polygon | None = None
+            plan_id = payload.get("plan_id")
+            dynamic_expected_raw = payload.get("active_ids")
+            dynamic_expected: set[int] | None = None
+            if isinstance(dynamic_expected_raw, list):
+                try:
+                    dynamic_expected = {int(i) for i in dynamic_expected_raw}
+                except (TypeError, ValueError):
+                    dynamic_expected = None
 
-            have_all = expected_set.issubset(cells.keys())
-            LOGGER.debug("Currently have cells for drones: %s", sorted(cells.keys()))
+            if plan_id is not None and plan_id != current_plan_id:
+                LOGGER.info("Starting new assignment batch plan_id=%s", plan_id)
+                polygons.clear()
+                current_plan_id = plan_id
+                current_expected = dynamic_expected or set(static_expected)
+            elif dynamic_expected:
+                current_expected = dynamic_expected
+            elif not current_expected and static_expected:
+                current_expected = set(static_expected)
+
+            if msg_type == "voronoi_cell":
+                polygon = _polygon_from_vertices(drone_id, payload)
+                latest_radius = payload.get("search_radius", latest_radius)
+                vertex_count = len(payload.get("vertices_xy") or [])
+                LOGGER.info(
+                    "Received Voronoi cell from drone_id=%s with %d vertices (mode=%s)",
+                    drone_id,
+                    vertex_count,
+                    payload.get("mode"),
+                )
+            elif msg_type == "region_assignment":
+                polygon = _polygon_from_assignment(payload)
+                latest_radius = payload.get("search_radius", latest_radius)
+                LOGGER.info(
+                    "Received region assignment from drone_id=%s with %d cells.",
+                    drone_id,
+                    len(payload.get("cells") or []),
+                )
+            else:
+                LOGGER.debug("Ignoring message with unexpected type '%s' from %s", msg_type, addr)
+                continue
+
+            if polygon is None or polygon.is_empty:
+                LOGGER.warning("Polygon for drone %s is empty or invalid; skipping.", drone_id)
+                continue
+
+            polygons[drone_id] = polygon
+
+            if current_expected:
+                have_all = current_expected.issubset(polygons.keys())
+            else:
+                have_all = bool(polygons)
+            LOGGER.debug(
+                "Plan %s: collected cells from %s / expected %s",
+                current_plan_id,
+                sorted(polygons.keys()),
+                sorted(current_expected) if current_expected else "any",
+            )
 
             if config.auto_plot and have_all:
-                subset = {drone_id: cells[drone_id] for drone_id in sorted(expected_set)}
-                diag = compute_diagnostics(subset)
-                log_diagnostics(subset, diag, sorted(expected_set))
-                plot_voronoi_cells(subset, diag)
+                order = sorted(current_expected) if current_expected else sorted(polygons.keys())
+                subset = {did: polygons[did] for did in order}
+                diag = compute_diagnostics(subset, latest_radius)
+                log_diagnostics(subset, diag, order)
+                plot_regions(subset, diag, block_display=not config.keep_listening)
                 if not config.keep_listening:
                     LOGGER.info("All expected cells plotted. Exiting.")
                     break
                 LOGGER.info("Keep-listening enabled – clearing cells for next batch.")
-                cells.clear()
+                polygons.clear()
+                latest_radius = None
+                if plan_id is not None:
+                    current_plan_id = None
+                current_expected = set(static_expected)
     finally:
         sock.close()
 
@@ -299,8 +376,8 @@ def parse_args() -> VisualizerConfig:
     parser.add_argument("--listen-port", type=int, default=62000, help="UDP port to listen on (default 62000).")
     parser.add_argument(
         "--expected-drones",
-        default="1,2,3,4,5",
-        help="Comma-separated list of drone IDs expected to report (default '1,2,3,4,5').",
+        default="",
+        help="Comma-separated list of drone IDs expected to report. Leave blank for dynamic detection.",
     )
     parser.add_argument(
         "--auto-plot",
