@@ -16,7 +16,7 @@ import logging
 import math
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -67,6 +67,8 @@ class MissionConfig:
     takeoff_delay: float
     vis_collector_host: str
     vis_collector_port: int
+    cell_size: float
+    grid_origin: Tuple[float, float] = (0.0, 0.0)
 
 
 @dataclass
@@ -126,15 +128,24 @@ class SwarmComm:
         self._summary_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._current_state: Optional[DroneState] = None
+        self._coverage_updates: List[Tuple[int, int]] = []
 
     async def start(self) -> None:
         """Create the UDP listener and spawn broadcaster/summary tasks."""
 
         listen_port = self.base_port + self.drone_id
         self.logger.info("Starting swarm listener on UDP port %d.", listen_port)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        sock.bind(("127.0.0.1", listen_port))
         self._listen_transport, _ = await self._loop.create_datagram_endpoint(
             lambda: SwarmReceiverProtocol(self._handle_datagram),
-            local_addr=("127.0.0.1", listen_port),
+            sock=sock,
         )
 
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
@@ -163,6 +174,9 @@ class SwarmComm:
 
         self._current_state = state
         self.swarm_state[self.drone_id] = state
+
+    def add_coverage_cells(self, cells: List[Tuple[int, int]]) -> None:
+        self._coverage_updates.extend(cells)
 
     def get_swarm_snapshot(self) -> Dict[int, DroneState]:
         """Return a shallow copy of the swarm state dictionary."""
@@ -212,6 +226,20 @@ class SwarmComm:
                             continue
                         peer_port = self.base_port + peer_id
                         self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
+                if self._coverage_updates:
+                    message = json.dumps(
+                        {
+                            "msg_type": "coverage_update",
+                            "drone_id": self.drone_id,
+                            "cells": self._coverage_updates,
+                        }
+                    ).encode("utf-8")
+                    for peer_id in range(1, self.swarm_size + 1):
+                        if peer_id == self.drone_id:
+                            continue
+                        peer_port = self.base_port + peer_id
+                        self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
+                    self._coverage_updates.clear()
                 await asyncio.sleep(self.broadcast_interval)
         except asyncio.CancelledError:
             pass
@@ -845,6 +873,23 @@ def local_xy_to_latlon(x: float, y: float, lat0: float, lon0: float) -> Tuple[fl
     return lat, lon
 
 
+def local_xy_to_grid(x: float, y: float, cfg: GridAssignmentConfig) -> Tuple[int, int]:
+    """Convert local XY (meters) to integer grid cell indices."""
+
+    nx, ny = cfg.grid_size
+    offset_x = -(nx * cfg.cell_size) / 2.0
+    offset_y = -(ny * cfg.cell_size) / 2.0
+    ix = int((x - offset_x) // cfg.cell_size)
+    iy = int((y - offset_y) // cfg.cell_size)
+    return ix, iy
+
+
+@dataclass
+class GridAssignmentConfig:
+    cell_size: float
+    grid_size: Tuple[int, int]
+
+
 def compute_v_formation_offset(drone_id: int) -> Tuple[float, float]:
     """Return (forward_m, lateral_m) offsets for each drone ID."""
 
@@ -1124,6 +1169,12 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         help="UDP port for Voronoi visualization collector.",
     )
     parser.add_argument(
+        "--grid-cell-size",
+        type=float,
+        default=20.0,
+        help="Coverage grid cell size (meters) for assignments.",
+    )
+    parser.add_argument(
         "--takeoff-delay",
         type=float,
         default=None,
@@ -1188,6 +1239,8 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         takeoff_delay=takeoff_delay,
         vis_collector_host=args.vis_collector_host,
         vis_collector_port=args.vis_collector_port,
+        cell_size=args.grid_cell_size,
+        grid_origin=(0.0, 0.0),
     )
 
 
