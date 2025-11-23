@@ -1,10 +1,10 @@
 """
 Coverage coordinator for Phase 6 – grid-based Voronoi assignments.
 
-Listens on the existing swarm UDP mesh, tracks active drones from "state"
-messages, partitions an XY grid of the search region, and broadcasts
-region_assignment payloads whenever the active set changes or on a periodic
-timer. No coverage updates or MAVSDK control are implemented in this step.
+Listens on the swarm UDP mesh, tracks active drones from "state" messages,
+collects coverage_update reports, and partitions only the remaining unexplored
+grid cells among the active drones. region_assignment payloads are broadcast
+whenever the active set changes so that agents can replan their search.
 """
 
 from __future__ import annotations
@@ -69,6 +69,9 @@ class CoverageCoordinator:
         self.pending_replan = False
         self.last_replan_time = 0.0
         self.plan_counter = 0
+        self.coverage = [[0 for _ in range(self.grid_side)] for _ in range(self.grid_side)]
+        self.explored_cells = 0
+        self.drone_plan_ids: Dict[int, int] = {}
 
     def _count_circle_cells(self) -> int:
         count = 0
@@ -86,6 +89,28 @@ class CoverageCoordinator:
     def _cell_inside_circle(self, ix: int, iy: int) -> bool:
         x, y = self._cell_center_xy(ix, iy)
         return x * x + y * y <= self.radius_sq
+
+    def _mark_cell_explored(self, ix: int, iy: int) -> bool:
+        if ix < 0 or iy < 0 or ix >= self.grid_side or iy >= self.grid_side:
+            return False
+        if not self._cell_inside_circle(ix, iy):
+            return False
+        if self.coverage[ix][iy]:
+            return False
+        self.coverage[ix][iy] = 1
+        self.explored_cells += 1
+        return True
+
+    def _coverage_summary(self) -> Dict[str, float]:
+        explored = min(self.explored_cells, self.circle_cell_count)
+        remaining = max(self.circle_cell_count - explored, 0)
+        pct = 100.0 * explored / self.circle_cell_count if self.circle_cell_count else 0.0
+        return {
+            "explored": explored,
+            "remaining": remaining,
+            "total": self.circle_cell_count,
+            "explored_pct": pct,
+        }
 
     def handle_state_message(self, payload: dict) -> None:
         drone_id = payload.get("drone_id")
@@ -128,6 +153,55 @@ class CoverageCoordinator:
             LOGGER.info("Drone %s reached search area – scheduling repartition.", drone_id)
             self.pending_replan = True
 
+    def handle_coverage_update(self, payload: dict) -> None:
+        cells = payload.get("cells") or []
+        if not cells:
+            return
+        drone_id = payload.get("drone_id")
+        try:
+            drone_id_int = int(drone_id) if drone_id is not None else None
+        except (TypeError, ValueError):
+            drone_id_int = None
+        plan_id = payload.get("plan_id")
+        if drone_id_int is not None and plan_id is not None:
+            expected_plan = self.drone_plan_ids.get(drone_id_int)
+            try:
+                plan_id_int = int(plan_id)
+            except (TypeError, ValueError):
+                plan_id_int = None
+            if expected_plan is not None and plan_id_int is not None and plan_id_int != expected_plan:
+                LOGGER.debug(
+                    "Ignoring coverage update from drone %s for stale plan %s (expected %s).",
+                    drone_id_int,
+                    plan_id_int,
+                    expected_plan,
+                )
+                return
+        updated = 0
+        for cell in cells:
+            if not isinstance(cell, (list, tuple)) or len(cell) != 2:
+                continue
+            try:
+                ix = int(cell[0])
+                iy = int(cell[1])
+            except (TypeError, ValueError):
+                continue
+            if self._mark_cell_explored(ix, iy):
+                updated += 1
+        if updated:
+            summary = self._coverage_summary()
+            LOGGER.info(
+                "Coverage update from drone %s (plan %s): +%d cells, explored=%.2f%% (%d/%d).",
+                drone_id,
+                plan_id,
+                updated,
+                summary["explored_pct"],
+                summary["explored"],
+                summary["total"],
+            )
+            if summary["remaining"] == 0:
+                LOGGER.info("All cells explored. Future assignments will be empty until new areas are added.")
+
     def remove_inactive_drones(self) -> None:
         now = time.time()
         removed = []
@@ -155,13 +229,17 @@ class CoverageCoordinator:
         assignments: Dict[int, List[List[int]]] = {drone_id: [] for drone_id in active_ids}
         positions = {drone_id: info.position_xy for drone_id, info in self.drone_infos.items() if info.ready}
 
+        remaining_cells = 0
         for ix in range(self.grid_side):
             for iy in range(self.grid_side):
-                if not self._cell_inside_circle(ix, iy):
+                if not self._cell_inside_circle(ix, iy) or self.coverage[ix][iy]:
                     continue
+                remaining_cells += 1
                 x, y = self._cell_center_xy(ix, iy)
                 best_id = min(active_ids, key=lambda did: self._distance_sq((x, y), positions[did]))
                 assignments[best_id].append([ix, iy])
+        if remaining_cells == 0:
+            LOGGER.info("Coverage grid fully explored; issuing idle assignments.")
         return assignments
 
     @staticmethod
@@ -170,7 +248,12 @@ class CoverageCoordinator:
         dy = p1[1] - p2[1]
         return dx * dx + dy * dy
 
-    async def broadcast_assignments(self, assignments: Dict[int, List[List[int]]]) -> None:
+    async def broadcast_assignments(
+        self,
+        assignments: Dict[int, List[List[int]]],
+        plan_id: int,
+        summary: Dict[str, float],
+    ) -> None:
         if not assignments:
             return
         loop = asyncio.get_running_loop()
@@ -181,8 +264,6 @@ class CoverageCoordinator:
             asyncio.DatagramProtocol,
             sock=sock,
         )
-        plan_id = self.plan_counter
-        self.plan_counter += 1
         try:
             for drone_id, cells in assignments.items():
                 payload = {
@@ -194,12 +275,14 @@ class CoverageCoordinator:
                     "search_radius": self.search_radius,
                     "active_ids": active_ids,
                     "plan_id": plan_id,
+                    "coverage_summary": summary,
                 }
                 message = json.dumps(payload).encode("utf-8")
                 dest = (self.broadcast_host, self.base_port + drone_id)
                 transport.sendto(message, dest)
                 if self.visualizer_port:
                     transport.sendto(message, (self.visualizer_host, self.visualizer_port))
+                self.drone_plan_ids[drone_id] = plan_id
         finally:
             transport.close()
 
@@ -207,21 +290,24 @@ class CoverageCoordinator:
         assignments = self.compute_assignments()
         if not assignments:
             return
+        plan_id = self.plan_counter
+        self.plan_counter += 1
         self.last_replan_time = time.time()
         self.pending_replan = False
 
-        total_cells = sum(len(cells) for cells in assignments.values())
-        unassigned = max(self.circle_cell_count - total_cells, 0)
-        unassigned_pct = (
-            100.0 * unassigned / self.circle_cell_count if self.circle_cell_count > 0 else 0.0
+        summary = self._coverage_summary()
+        LOGGER.info(
+            "Plan %d: explored=%.2f%% (%d/%d cells), remaining=%d, active drones=%d",
+            plan_id,
+            summary["explored_pct"],
+            summary["explored"],
+            summary["total"],
+            summary["remaining"],
+            len(assignments),
         )
-
-        LOGGER.info("Active drones: %d", len(assignments))
         for drone_id, cells in assignments.items():
             LOGGER.info("  Drone %d: %d cells assigned", drone_id, len(cells))
-        LOGGER.info("Unassigned cells: %d (%.2f%%)", unassigned, unassigned_pct)
-
-        await self.broadcast_assignments(assignments)
+        await self.broadcast_assignments(assignments, plan_id, summary)
 
 
 class MeshProtocol(asyncio.DatagramProtocol):
@@ -236,6 +322,8 @@ class MeshProtocol(asyncio.DatagramProtocol):
         msg_type = payload.get("msg_type") or payload.get("type") or "state"
         if msg_type == "state":
             self.coordinator.handle_state_message(payload)
+        elif msg_type == "coverage_update":
+            self.coordinator.handle_coverage_update(payload)
 
 
 async def main() -> None:

@@ -17,7 +17,7 @@ import json
 import logging
 import socket
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -51,6 +51,29 @@ def parse_expected(expected: str) -> List[int]:
     return sorted(set(ids))
 
 
+def _plot_polygon(ax, poly: Polygon, *, label: Optional[str] = None, color=None, alpha: float = 0.3):
+    """Helper to draw polygons (including MultiPolygons) with consistent styling."""
+
+    if poly.is_empty:
+        return None
+
+    polygons = [poly]
+    if poly.geom_type == "MultiPolygon":
+        polygons = [p for p in poly.geoms if not p.is_empty]
+        if not polygons:
+            return None
+
+    face_color = color
+    for idx, polygon in enumerate(polygons):
+        vertices = list(polygon.exterior.coords)
+        xs = [p[0] for p in vertices]
+        ys = [p[1] for p in vertices]
+        patch = ax.fill(xs, ys, alpha=alpha, color=face_color, label=label if idx == 0 else None)
+        face_color = face_color or patch[0].get_facecolor()
+        ax.plot(xs, ys, color=face_color, linewidth=1.2)
+    return face_color
+
+
 def plot_regions(polygons: Dict[int, Polygon], diag: dict | None, block_display: bool = True) -> None:
     """Plot all Voronoi cells on a shared Matplotlib figure."""
 
@@ -64,22 +87,11 @@ def plot_regions(polygons: Dict[int, Polygon], diag: dict | None, block_display:
         poly = polygons[drone_id]
         if poly.is_empty:
             continue
-        vertices = list(poly.exterior.coords)
+        _plot_polygon(ax, poly, label=f"Drone {drone_id}")
         centroid = (poly.centroid.x, poly.centroid.y)
         area = poly.area
-
-        if len(vertices) < 3:
-            LOGGER.warning("Drone %d polygon has too few vertices (%d). Skipping plot.", drone_id, len(vertices))
-            continue
-
-        xs = [p[0] for p in vertices]
-        ys = [p[1] for p in vertices]
-        patch = ax.fill(xs, ys, alpha=0.3, label=f"Drone {drone_id}")
-        edge_color = patch[0].get_facecolor()
-        ax.plot(xs, ys, color=edge_color, linewidth=1.5)
         ax.plot(centroid[0], centroid[1], "ko", markersize=4)
-        label = f"{drone_id}\n{area:.0f} m²"
-        ax.text(centroid[0], centroid[1], label, fontsize=8, ha="center", va="center")
+        ax.text(centroid[0], centroid[1], f"{drone_id}\n{area:.0f} m^2", fontsize=8, ha="center", va="center")
 
     if search_radius:
         theta = np.linspace(0, 2 * np.pi, 720)
@@ -112,19 +124,33 @@ def log_diagnostics(polygons: Dict[int, Polygon], diag: dict | None, order: Iter
     circle_area = diag["circle_area"]
     LOGGER.info("=== Swarm Voronoi diagnostics (local XY) ===")
     LOGGER.info("Search radius         : %.1f m", diag["search_radius"])
-    LOGGER.info("Circle area           : %.1f m² (100.0%%)", circle_area)
+    LOGGER.info("Circle area           : %.1f m^2 (100.0%%)", circle_area)
+
+    coverage_info = diag.get("coverage_info")
+    if coverage_info:
+        explored = coverage_info.get("explored", 0)
+        total = coverage_info.get("total", 0)
+        explored_pct = coverage_info.get("explored_pct", 0.0)
+        remaining = coverage_info.get("remaining", 0)
+        remaining_pct = coverage_info.get("remaining_pct", 0.0)
+        LOGGER.info(
+            "Explored grid         : %.2f%% (%d / %d cells)",
+            explored_pct,
+            explored,
+            total,
+        )
+        LOGGER.info(
+            "Remaining cells       : %d (%.2f%%)",
+            remaining,
+            remaining_pct,
+        )
     LOGGER.info(
-        "Covered area (union)  : %.1f m² (%.2f%%)",
-        diag["covered_area"],
-        diag["coverage_pct"],
+        "Remaining plan area   : %.1f m^2 (%.2f%%)",
+        diag["remaining_area"],
+        diag["remaining_pct"],
     )
     LOGGER.info(
-        "Uncovered gaps        : %.1f m² (%.4f%%)",
-        diag["gap_area"],
-        diag["gap_pct"],
-    )
-    LOGGER.info(
-        "Overlap between cells : %.1f m² (%.4f%%)",
+        "Overlap between cells : %.1f m^2 (%.4f%%)",
         diag["overlap_area"],
         diag["overlap_pct"],
     )
@@ -137,11 +163,16 @@ def log_diagnostics(polygons: Dict[int, Polygon], diag: dict | None, order: Iter
             continue
         area = poly.area
         pct = 100.0 * area / circle_area if circle_area > 0 else 0.0
-        LOGGER.info("  Drone %d: %.1f m² (%.2f%%)", drone_id, area, pct)
+        LOGGER.info("  Drone %d: %.1f m^2 (%.2f%%)", drone_id, area, pct)
 
 
-def compute_diagnostics(polygons: Dict[int, Polygon], search_radius: float | None) -> dict | None:
-    """Compute coverage/overlap diagnostics for already-built polygons."""
+def compute_diagnostics(
+    polygons: Dict[int, Polygon],
+    search_radius: float | None,
+    coverage_summary: dict | None = None,
+    explored_poly: Polygon | None = None,
+) -> dict | None:
+    """Compute diagnostics for polygons plus optional coverage summary."""
 
     if not search_radius or search_radius <= 0:
         LOGGER.warning("No valid search radius provided; skipping diagnostics.")
@@ -150,14 +181,10 @@ def compute_diagnostics(polygons: Dict[int, Polygon], search_radius: float | Non
     circle_poly = Point(0.0, 0.0).buffer(search_radius, resolution=512)
     circle_area = circle_poly.area
 
-    if polygons:
-        union_poly = unary_union(list(polygons.values()))
-    else:
-        union_poly = Polygon()
-
-    covered_poly = union_poly.intersection(circle_poly) if not union_poly.is_empty else Polygon()
-    covered_area = covered_poly.area
-    gap_area = max(circle_area - covered_area, 0.0)
+    union_poly = unary_union(list(polygons.values())) if polygons else Polygon()
+    remaining_poly = union_poly.intersection(circle_poly) if not union_poly.is_empty else Polygon()
+    remaining_area = remaining_poly.area
+    remaining_pct = remaining_area / circle_area * 100.0 if circle_area > 0 else 0.0
 
     overlap_area = 0.0
     items = list(polygons.items())
@@ -174,16 +201,21 @@ def compute_diagnostics(polygons: Dict[int, Polygon], search_radius: float | Non
                     exc,
                 )
 
-    circle_inv = 1.0 / circle_area if circle_area > 0 else 0.0
+    coverage_pct = coverage_summary["explored_pct"] if coverage_summary else (100.0 - remaining_pct)
+    gap_pct = 100.0 - coverage_pct
+    overlap_pct = overlap_area / circle_area * 100.0 if circle_area > 0 else 0.0
+
     return {
         "search_radius": search_radius,
         "circle_area": circle_area,
-        "covered_area": covered_area,
-        "gap_area": gap_area,
+        "remaining_area": remaining_area,
+        "remaining_pct": remaining_pct,
         "overlap_area": overlap_area,
-        "coverage_pct": covered_area * circle_inv * 100.0,
-        "gap_pct": gap_area * circle_inv * 100.0,
-        "overlap_pct": overlap_area * circle_inv * 100.0,
+        "overlap_pct": overlap_pct,
+        "coverage_pct": coverage_pct,
+        "gap_pct": gap_pct,
+        "coverage_info": coverage_summary,
+        "explored_poly": explored_poly,
     }
 
 
@@ -222,19 +254,16 @@ def _polygon_from_vertices(drone_id: int, payload: dict) -> Polygon | None:
     return poly
 
 
-def _polygon_from_assignment(payload: dict) -> Polygon | None:
-    """Convert a region_assignment payload into a polygon via union of grid cells."""
+def _polygon_from_cells(origin_xy, cell_size, cells) -> Optional[Polygon]:
+    """Convert an origin + cell list into a polygon."""
 
-    origin = payload.get("origin_xy")
-    cell_size = payload.get("cell_size")
-    cells = payload.get("cells") or []
-    if origin is None or cell_size is None or not cells:
+    if origin_xy is None or cell_size is None or not cells:
         return None
     try:
-        origin_x = float(origin[0])
-        origin_y = float(origin[1])
+        origin_x = float(origin_xy[0])
+        origin_y = float(origin_xy[1])
         cell_size = float(cell_size)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, IndexError):
         return None
 
     boxes = []
@@ -255,8 +284,17 @@ def _polygon_from_assignment(payload: dict) -> Polygon | None:
     try:
         return unary_union(boxes)
     except Exception as exc:
-        LOGGER.warning("Failed to build polygon from assignment: %s", exc)
+        LOGGER.warning("Failed to build polygon from cell list: %s", exc)
         return None
+
+
+def _polygon_from_assignment(payload: dict) -> Polygon | None:
+    """Convert a region_assignment payload into a polygon via union of grid cells."""
+
+    origin = payload.get("origin_xy")
+    cell_size = payload.get("cell_size")
+    cells = payload.get("cells") or []
+    return _polygon_from_cells(origin, cell_size, cells)
 
 
 def run_visualizer(config: VisualizerConfig) -> None:
@@ -276,6 +314,8 @@ def run_visualizer(config: VisualizerConfig) -> None:
     current_plan_id: int | None = None
     polygons: Dict[int, Polygon] = {}
     latest_radius: float | None = None
+    latest_summary: Optional[dict] = None
+    latest_explored_poly: Optional[Polygon] = None
 
     try:
         while True:
@@ -307,6 +347,8 @@ def run_visualizer(config: VisualizerConfig) -> None:
                 polygons.clear()
                 current_plan_id = plan_id
                 current_expected = dynamic_expected or set(static_expected)
+                latest_summary = None
+                latest_explored_poly = None
             elif dynamic_expected:
                 current_expected = dynamic_expected
             elif not current_expected and static_expected:
@@ -325,6 +367,12 @@ def run_visualizer(config: VisualizerConfig) -> None:
             elif msg_type == "region_assignment":
                 polygon = _polygon_from_assignment(payload)
                 latest_radius = payload.get("search_radius", latest_radius)
+                latest_summary = payload.get("coverage_summary")
+                latest_explored_poly = _polygon_from_cells(
+                    payload.get("origin_xy"),
+                    payload.get("cell_size"),
+                    payload.get("explored_cells") or [],
+                )
                 LOGGER.info(
                     "Received region assignment from drone_id=%s with %d cells.",
                     drone_id,
@@ -354,13 +402,13 @@ def run_visualizer(config: VisualizerConfig) -> None:
             if config.auto_plot and have_all:
                 order = sorted(current_expected) if current_expected else sorted(polygons.keys())
                 subset = {did: polygons[did] for did in order}
-                diag = compute_diagnostics(subset, latest_radius)
+                diag = compute_diagnostics(subset, latest_radius, latest_summary, latest_explored_poly)
                 log_diagnostics(subset, diag, order)
                 plot_regions(subset, diag, block_display=not config.keep_listening)
                 if not config.keep_listening:
                     LOGGER.info("All expected cells plotted. Exiting.")
                     break
-                LOGGER.info("Keep-listening enabled – clearing cells for next batch.")
+                LOGGER.info("Keep-listening enabled â€“ clearing cells for next batch.")
                 polygons.clear()
                 latest_radius = None
                 if plan_id is not None:

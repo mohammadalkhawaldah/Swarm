@@ -62,6 +62,8 @@ class MissionConfig:
     coverage_spacing: float
     spiral_step: float
     spiral_theta_step: float
+    coverage_batch_size: int
+    coverage_report_interval: float
     connection_timeout: float
     readiness_timeout: float
     takeoff_delay: float
@@ -135,7 +137,6 @@ class SwarmComm:
         self._summary_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._current_state: Optional[DroneState] = None
-        self._coverage_updates: List[Tuple[int, int]] = []
         self._assignment_callback = assignment_callback
         self._coord_host = coordinator_host
         self._coord_port = coordinator_port
@@ -185,8 +186,20 @@ class SwarmComm:
         self._current_state = state
         self.swarm_state[self.drone_id] = state
 
-    def add_coverage_cells(self, cells: List[Tuple[int, int]]) -> None:
-        self._coverage_updates.extend(cells)
+    def send_coverage_update(self, plan_id: int, cells: List[Tuple[int, int]]) -> None:
+        """Send a coverage_update packet directly to the coordinator."""
+
+        if not cells or self._listen_transport is None or not self._coord_port:
+            return
+        payload = {
+            "msg_type": "coverage_update",
+            "drone_id": self.drone_id,
+            "plan_id": plan_id,
+            "cells": [[int(ix), int(iy)] for ix, iy in cells],
+            "timestamp": time.time(),
+        }
+        message = json.dumps(payload).encode("utf-8")
+        self._listen_transport.sendto(message, (self._coord_host, self._coord_port))
 
     def get_swarm_snapshot(self) -> Dict[int, DroneState]:
         """Return a shallow copy of the swarm state dictionary."""
@@ -247,22 +260,6 @@ class SwarmComm:
                         self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
                     if self._coord_port:
                         self._listen_transport.sendto(message, (self._coord_host, self._coord_port))
-                if self._coverage_updates:
-                    message = json.dumps(
-                        {
-                            "msg_type": "coverage_update",
-                            "drone_id": self.drone_id,
-                            "cells": self._coverage_updates,
-                        }
-                    ).encode("utf-8")
-                    for peer_id in range(1, self.swarm_size + 1):
-                        if peer_id == self.drone_id:
-                            continue
-                        peer_port = self.base_port + peer_id
-                        self._listen_transport.sendto(message, ("127.0.0.1", peer_port))
-                    if self._coord_port:
-                        self._listen_transport.sendto(message, (self._coord_host, self._coord_port))
-                    self._coverage_updates.clear()
                 await asyncio.sleep(self.broadcast_interval)
         except asyncio.CancelledError:
             pass
@@ -295,6 +292,60 @@ class SwarmComm:
                 f"lat={state.lat:.6f}, lon={state.lon:.6f}, alt={state.alt_amsl:.1f}m, heading={state.heading_deg:.1f}"
             )
         self.logger.info("\n".join(summary_lines))
+
+
+class CoverageTracker:
+    """Tracks visited cells and batches coverage_update messages."""
+
+    def __init__(
+        self,
+        comm: SwarmComm,
+        logger: DroneLoggerAdapter,
+        batch_size: int = 5,
+        report_interval: float = 5.0,
+    ):
+        self._comm = comm
+        self._logger = logger
+        self._batch_size = max(1, batch_size)
+        self._report_interval = max(1.0, report_interval)
+        self._covered: set[Tuple[int, int]] = set()
+        self._pending: List[Tuple[int, int]] = []
+        self._last_send = time.time()
+        self._last_plan_id: Optional[int] = None
+        self.total_batches = 0
+        self.unique_cells = 0
+
+    def mark_cell(self, plan_id: Optional[int], cell: Tuple[int, int]) -> None:
+        if plan_id is None or cell in self._covered:
+            return
+        self._covered.add(cell)
+        self.unique_cells += 1
+        self._pending.append(cell)
+        self._last_plan_id = plan_id
+        if len(self._pending) >= self._batch_size:
+            self.flush(plan_id)
+
+    def maybe_flush(self, plan_id: Optional[int]) -> None:
+        if not self._pending:
+            return
+        if time.time() - self._last_send >= self._report_interval:
+            self.flush(plan_id)
+
+    def flush(self, plan_id: Optional[int] = None) -> None:
+        if not self._pending:
+            return
+        plan = plan_id if plan_id is not None else self._last_plan_id
+        if plan is None:
+            return
+        cells = list(self._pending)
+        self._comm.send_coverage_update(plan, cells)
+        self._logger.info("Sent coverage_update for plan %s with %d cells.", plan, len(cells))
+        self.total_batches += 1
+        self._pending.clear()
+        self._last_send = time.time()
+
+    def finalize(self) -> None:
+        self.flush()
 
 
 async def connect_and_prepare(config: MissionConfig, logger: DroneLoggerAdapter) -> tuple[System, HomePosition]:
@@ -370,7 +421,14 @@ async def run_mission(config: MissionConfig) -> None:
     log_configuration(config, logger)
     drone, home_pos = await connect_and_prepare(config, logger)
 
-    assignment_holder: Dict[str, Optional[RegionAssignment]] = {"assignment": None}
+    assignment_state: Dict[str, Optional[RegionAssignment]] = {"current": None, "pending": None}
+    assignment_event = asyncio.Event()
+
+    def refresh_assignment_event() -> None:
+        if assignment_state.get("current"):
+            assignment_event.set()
+        else:
+            assignment_event.clear()
 
     def handle_assignment(payload: dict) -> None:
         try:
@@ -387,9 +445,6 @@ async def run_mission(config: MissionConfig) -> None:
                 parsed_cells.append((ix, iy))
             except (TypeError, ValueError, IndexError):
                 continue
-        if not parsed_cells:
-            logger.warning("Received region assignment with no valid cells.")
-            return
         origin_xy = payload.get("origin_xy") or [0.0, 0.0]
         try:
             origin_x = float(origin_xy[0])
@@ -401,22 +456,41 @@ async def run_mission(config: MissionConfig) -> None:
         except (TypeError, ValueError):
             cell_size = config.cell_size
 
-        assignment_holder["assignment"] = RegionAssignment(
+        plan_id = payload.get("plan_id")
+        try:
+            plan_id_int = int(plan_id) if plan_id is not None else 0
+        except (TypeError, ValueError):
+            plan_id_int = 0
+        active_ids = []
+        for item in payload.get("active_ids") or []:
+            try:
+                active_ids.append(int(item))
+            except (TypeError, ValueError):
+                continue
+
+        assignment = RegionAssignment(
             origin_xy=(origin_x, origin_y),
             cell_size=cell_size,
             cells=parsed_cells,
             received_time=time.time(),
+            plan_id=plan_id_int,
+            active_ids=active_ids,
         )
-        ix_vals = [c[0] for c in parsed_cells]
-        iy_vals = [c[1] for c in parsed_cells]
-        logger.info(
-            "Received region assignment: %d cells (ix range %d-%d, iy range %d-%d).",
-            len(parsed_cells),
-            min(ix_vals),
-            max(ix_vals),
-            min(iy_vals),
-            max(iy_vals),
-        )
+        if assignment_state["current"] is None:
+            assignment_state["current"] = assignment
+            refresh_assignment_event()
+            logger.info(
+                "Received region assignment plan %s with %d cells.",
+                plan_id_int,
+                len(parsed_cells),
+            )
+        else:
+            assignment_state["pending"] = assignment
+            logger.info(
+                "Queued new assignment plan %s (%d cells). Will switch after current row.",
+                plan_id_int,
+                len(parsed_cells),
+            )
 
     comm = SwarmComm(
         config.drone_id,
@@ -480,23 +554,27 @@ async def run_mission(config: MissionConfig) -> None:
         logger.info("Reached assigned V-waypoint. Holding for %.1f seconds.", config.initial_loiter_seconds)
         await asyncio.sleep(config.initial_loiter_seconds)
 
-        waypoints_latlon: List[Tuple[float, float]] = []
-        assignment = assignment_holder.get("assignment")
-        if assignment and assignment.cells:
-            logger.info(
-                "Executing assigned grid search with %d cells (cell_size=%.1f m).",
-                len(assignment.cells),
-                assignment.cell_size,
-            )
-            waypoints_latlon = await execute_assigned_region_search(
-                drone=drone,
-                config=config,
-                assignment=assignment,
-                search_alt_amsl=search_alt_amsl,
-                logger=logger,
-            )
-        else:
-            logger.warning("No region assignment received before search. Falling back to Voronoi partition.")
+        coverage_tracker = CoverageTracker(
+            comm=comm,
+            logger=logger,
+            batch_size=int(config.coverage_batch_size),
+            report_interval=float(config.coverage_report_interval),
+        )
+
+        centroid_latlon: Tuple[float, float] = (float("nan"), float("nan"))
+        assignments_executed = await handle_coordinator_assignments(
+            drone=drone,
+            config=config,
+            assignment_state=assignment_state,
+            assignment_event=assignment_event,
+            update_assignment_event=refresh_assignment_event,
+            coverage_tracker=coverage_tracker,
+            search_alt_amsl=search_alt_amsl,
+            logger=logger,
+        )
+
+        if not assignments_executed:
+            logger.warning("No coordinator assignment executed before search. Falling back to Voronoi partition.")
             await wait_for_voronoi_data(comm, config, logger)
             swarm_snapshot = comm.get_swarm_snapshot()
             voronoi_polygon = compute_voronoi_cell(config, swarm_snapshot, logger)
@@ -505,7 +583,7 @@ async def run_mission(config: MissionConfig) -> None:
             logger.info("Voronoi cell area ≈ %.1f m^2.", cell_area)
             send_voronoi_cell_to_collector(voronoi_polygon, centroid_local, cell_area, config, logger)
 
-            waypoints_latlon = await execute_search_mode(
+            await execute_search_mode(
                 drone=drone,
                 config=config,
                 centroid_latlon=centroid_latlon,
@@ -521,13 +599,18 @@ async def run_mission(config: MissionConfig) -> None:
 
         logger.info("Disarming.")
         await drone.action.disarm()
-        logger.info(
-            "Mission completed. Mode=%d, centroid=(%.7f, %.7f), waypoints_flown=%d",
-            config.search_mode,
-            centroid_latlon[0],
-            centroid_latlon[1],
-            len(waypoints_latlon),
-        )
+        if assignments_executed:
+            logger.info(
+                "Mission completed with coordinator assignments. Coverage cells reported=%d in %d batches.",
+                coverage_tracker.unique_cells,
+                coverage_tracker.total_batches,
+            )
+        else:
+            logger.info(
+                "Mission completed via Voronoi fallback. centroid=(%.7f, %.7f).",
+                centroid_latlon[0],
+                centroid_latlon[1],
+            )
     finally:
         for task in telem_tasks:
             task.cancel()
@@ -944,15 +1027,24 @@ def convert_cells_to_local_points(
 def build_snake_path(points: List[Tuple[int, int, float, float]]) -> List[Tuple[int, int, float, float]]:
     """Sort cell centers in a snake (lawn-mower) order."""
 
+    ordered: List[Tuple[int, int, float, float]] = []
+    for row in build_snake_rows(points):
+        ordered.extend(row)
+    return ordered
+
+
+def build_snake_rows(points: List[Tuple[int, int, float, float]]) -> List[List[Tuple[int, int, float, float]]]:
+    """Return snake path grouped by rows (iy) for row-wise execution."""
+
     rows: Dict[int, List[Tuple[int, int, float, float]]] = {}
     for ix, iy, x, y in points:
         rows.setdefault(iy, []).append((ix, iy, x, y))
 
-    ordered: List[Tuple[int, int, float, float]] = []
+    ordered_rows: List[List[Tuple[int, int, float, float]]] = []
     for idx, (iy, row_cells) in enumerate(sorted(rows.items())):
         row_cells.sort(key=lambda item: item[0], reverse=(idx % 2 == 1))
-        ordered.extend(row_cells)
-    return ordered
+        ordered_rows.append(row_cells)
+    return ordered_rows
 
 
 async def goto_local_xy(
@@ -979,54 +1071,138 @@ async def goto_local_xy(
     return lat, lon
 
 
-async def execute_assigned_region_search(
+async def handle_coordinator_assignments(
+    drone: System,
+    config: MissionConfig,
+    assignment_state: Dict[str, Optional[RegionAssignment]],
+    assignment_event: asyncio.Event,
+    update_assignment_event,
+    coverage_tracker: CoverageTracker,
+    search_alt_amsl: float,
+    logger: DroneLoggerAdapter,
+) -> bool:
+    """Execute coordinator-provided assignments with dynamic reassignment support."""
+
+    executed_any = False
+
+    async def _wait_for_assignment(timeout: float) -> bool:
+        if assignment_state.get("current"):
+            return True
+        try:
+            await asyncio.wait_for(assignment_event.wait(), timeout=timeout)
+            return assignment_state.get("current") is not None
+        except asyncio.TimeoutError:
+            return False
+
+    if not await _wait_for_assignment(config.voronoi_wait_seconds):
+        return False
+
+    while await _wait_for_assignment(config.voronoi_wait_seconds):
+        assignment = assignment_state.get("current")
+        if assignment is None:
+            continue
+        executed_any = True
+        result = await _fly_assignment_rows(
+            drone=drone,
+            config=config,
+            assignment=assignment,
+            search_alt_amsl=search_alt_amsl,
+            logger=logger,
+            coverage_tracker=coverage_tracker,
+            assignment_state=assignment_state,
+        )
+        coverage_tracker.flush(assignment.plan_id)
+
+        if result == "switch":
+            assignment_state["current"] = assignment_state.get("pending")
+            assignment_state["pending"] = None
+            update_assignment_event()
+            continue
+
+        assignment_state["current"] = assignment_state.get("pending")
+        assignment_state["pending"] = None
+        update_assignment_event()
+        if assignment_state["current"] is None:
+            logger.info("Assignment complete – waiting for the next plan.")
+
+    coverage_tracker.finalize()
+    if coverage_tracker.unique_cells:
+        logger.info(
+            "Coverage summary: %d unique cells visited in %d batches.",
+            coverage_tracker.unique_cells,
+            coverage_tracker.total_batches,
+        )
+    return executed_any
+
+
+async def _fly_assignment_rows(
     drone: System,
     config: MissionConfig,
     assignment: RegionAssignment,
     search_alt_amsl: float,
     logger: DroneLoggerAdapter,
-) -> List[Tuple[float, float]]:
-    """Follow the snake path defined by the coordinator assignment."""
+    coverage_tracker: CoverageTracker,
+    assignment_state: Dict[str, Optional[RegionAssignment]],
+) -> str:
+    """Fly the snake path row-by-row, allowing mid-row reassignment."""
 
     cell_points = convert_cells_to_local_points(assignment.cells, assignment.origin_xy, assignment.cell_size)
+    plan_id = assignment.plan_id
     if not cell_points:
-        logger.warning("Assigned region contains no valid cells.")
-        return []
+        logger.info("Assignment plan %s contains no cells. Holding for %.1f seconds.", plan_id, config.loiter_after_pattern)
+        await asyncio.sleep(config.loiter_after_pattern)
+        return "idle"
 
     centroid_x = sum(p[2] for p in cell_points) / len(cell_points)
     centroid_y = sum(p[3] for p in cell_points) / len(cell_points)
-    logger.info("Flying to assigned centroid at local (%.1f, %.1f).", centroid_x, centroid_y)
+    logger.info(
+        "Plan %s: flying to centroid at local (%.1f, %.1f) before starting snake rows.",
+        plan_id,
+        centroid_x,
+        centroid_y,
+    )
     await goto_local_xy(drone, config, centroid_x, centroid_y, search_alt_amsl, logger)
 
-    path = build_snake_path(cell_points)
-    logger.info("Executing snake path with %d waypoints.", len(path))
-    flown: List[Tuple[float, float]] = []
-    for ix, iy, x_local, y_local in path:
-        lat, lon = local_xy_to_latlon(x_local, y_local, config.target_lat, config.target_lon)
-        logger.info(
-            "Visiting cell (%d, %d) at lat=%.7f lon=%.7f (local %.1f, %.1f).",
-            ix,
-            iy,
-            lat,
-            lon,
-            x_local,
-            y_local,
-        )
-        await drone.action.goto_location(lat, lon, search_alt_amsl, config.yaw_deg)
-        await _wait_until_at_position(
-            drone,
-            target_lat=lat,
-            target_lon=lon,
-            target_alt_amsl=search_alt_amsl,
-            horiz_threshold_m=5.0,
-            vert_threshold_m=3.0,
-            logger=logger,
-        )
-        flown.append((lat, lon))
+    rows = build_snake_rows(cell_points)
+    total_rows = len(rows)
+    for row_idx, row in enumerate(rows, start=1):
+        for ix, iy, x_local, y_local in row:
+            lat, lon = local_xy_to_latlon(x_local, y_local, config.target_lat, config.target_lon)
+            logger.info(
+                "Plan %s row %d/%d – visiting cell (%d, %d) at lat=%.7f lon=%.7f.",
+                plan_id,
+                row_idx,
+                total_rows,
+                ix,
+                iy,
+                lat,
+                lon,
+            )
+            await drone.action.goto_location(lat, lon, search_alt_amsl, config.yaw_deg)
+            await _wait_until_at_position(
+                drone,
+                target_lat=lat,
+                target_lon=lon,
+                target_alt_amsl=search_alt_amsl,
+                horiz_threshold_m=5.0,
+                vert_threshold_m=3.0,
+                logger=logger,
+            )
+            coverage_tracker.mark_cell(plan_id, (ix, iy))
+            coverage_tracker.maybe_flush(plan_id)
 
-    logger.info("Assigned region path complete. Loitering for %.1f seconds.", config.loiter_after_pattern)
+        logger.info("Completed row %d/%d for plan %s.", row_idx, total_rows, plan_id)
+        if assignment_state.get("pending"):
+            logger.info(
+                "Pending assignment plan %s detected – switching after row %d.",
+                assignment_state["pending"].plan_id,
+                row_idx,
+            )
+            return "switch"
+
+    logger.info("Assignment plan %s fully covered. Loitering %.1f seconds.", plan_id, config.loiter_after_pattern)
     await asyncio.sleep(config.loiter_after_pattern)
-    return flown
+    return "done"
 
 
 def extract_lines(geom) -> List[Iterable[Tuple[float, float]]]:
@@ -1104,6 +1280,8 @@ class RegionAssignment:
     cell_size: float
     cells: List[Tuple[int, int]]
     received_time: float
+    plan_id: int = 0
+    active_ids: List[int] = field(default_factory=list)
 
 
 def compute_v_formation_offset(drone_id: int) -> Tuple[float, float]:
@@ -1373,6 +1551,18 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         help="Angular increment (radians) between spiral waypoints.",
     )
     parser.add_argument(
+        "--coverage-batch-size",
+        type=int,
+        default=5,
+        help="Number of cells to include in each coverage_update batch.",
+    )
+    parser.add_argument(
+        "--coverage-report-interval",
+        type=float,
+        default=5.0,
+        help="Maximum seconds between automatic coverage_update flushes.",
+    )
+    parser.add_argument(
         "--vis-collector-host",
         type=str,
         default="127.0.0.1",
@@ -1462,6 +1652,8 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         coverage_spacing=args.coverage_spacing,
         spiral_step=args.spiral_step,
         spiral_theta_step=args.spiral_theta_step,
+        coverage_batch_size=args.coverage_batch_size,
+        coverage_report_interval=args.coverage_report_interval,
         connection_timeout=args.connection_timeout,
         readiness_timeout=args.readiness_timeout,
         takeoff_delay=takeoff_delay,
