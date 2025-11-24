@@ -73,6 +73,7 @@ class MissionConfig:
     grid_origin: Tuple[float, float] = (0.0, 0.0)
     coordinator_port: int = 61000
     coordinator_host: str = "127.0.0.1"
+    cruise_speed: float = 15.0
 
 
 @dataclass
@@ -510,6 +511,13 @@ async def run_mission(config: MissionConfig) -> None:
         if config.takeoff_delay > 0:
             logger.info("Waiting %.1f seconds before takeoff (deconfliction delay).", config.takeoff_delay)
             await asyncio.sleep(config.takeoff_delay)
+
+        if config.cruise_speed > 0:
+            try:
+                await drone.action.set_maximum_speed(config.cruise_speed)
+                logger.info("Set cruise speed to %.1f m/s.", config.cruise_speed)
+            except Exception as exc:
+                logger.warning("Unable to set cruise speed: %s", exc)
 
         logger.info("Setting takeoff altitude to %.1f m AGL.", config.takeoff_alt_agl)
         await drone.action.set_takeoff_altitude(config.takeoff_alt_agl)
@@ -1153,16 +1161,6 @@ async def _fly_assignment_rows(
         await asyncio.sleep(config.loiter_after_pattern)
         return "idle"
 
-    centroid_x = sum(p[2] for p in cell_points) / len(cell_points)
-    centroid_y = sum(p[3] for p in cell_points) / len(cell_points)
-    logger.info(
-        "Plan %s: flying to centroid at local (%.1f, %.1f) before starting snake rows.",
-        plan_id,
-        centroid_x,
-        centroid_y,
-    )
-    await goto_local_xy(drone, config, centroid_x, centroid_y, search_alt_amsl, logger)
-
     rows = build_snake_rows(cell_points)
     total_rows = len(rows)
     for row_idx, row in enumerate(rows, start=1):
@@ -1522,7 +1520,7 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
     parser.add_argument(
         "--search-radius",
         type=float,
-        default=400.0,
+        default=200.0,
         help="Bounding radius (meters) for Voronoi search region.",
     )
     parser.add_argument(
@@ -1549,6 +1547,12 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         type=float,
         default=0.4,
         help="Angular increment (radians) between spiral waypoints.",
+    )
+    parser.add_argument(
+        "--cruise-speed",
+        type=float,
+        default=15.0,
+        help="Target cruise speed in m/s (set as MAV maximum speed).",
     )
     parser.add_argument(
         "--coverage-batch-size",
@@ -1654,6 +1658,7 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
         spiral_theta_step=args.spiral_theta_step,
         coverage_batch_size=args.coverage_batch_size,
         coverage_report_interval=args.coverage_report_interval,
+        cruise_speed=args.cruise_speed,
         connection_timeout=args.connection_timeout,
         readiness_timeout=args.readiness_timeout,
         takeoff_delay=takeoff_delay,

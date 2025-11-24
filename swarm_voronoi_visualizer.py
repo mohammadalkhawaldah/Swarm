@@ -16,8 +16,9 @@ import argparse
 import json
 import logging
 import socket
+import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,6 +36,7 @@ class VisualizerConfig:
     expected_drones: List[int]
     auto_plot: bool
     keep_listening: bool
+    plot_interval: float
 
 
 def parse_expected(expected: str) -> List[int]:
@@ -74,10 +76,24 @@ def _plot_polygon(ax, poly: Polygon, *, label: Optional[str] = None, color=None,
     return face_color
 
 
-def plot_regions(polygons: Dict[int, Polygon], diag: dict | None, block_display: bool = True) -> None:
-    """Plot all Voronoi cells on a shared Matplotlib figure."""
+def plot_regions(
+    polygons: Dict[int, Polygon],
+    diag: dict | None,
+    block_display: bool = True,
+    axes: Optional[Tuple["plt.Figure", "plt.Axes"]] = None,
+) -> Tuple["plt.Figure", "plt.Axes"]:
+    """Plot all Voronoi cells on a shared Matplotlib figure.
 
-    fig, ax = plt.subplots()
+    If ``axes`` is provided, the plot is redrawn within the same figure/axes
+    (useful for live refreshing). Returns the figure/axes used.
+    """
+
+    if axes:
+        fig, ax = axes
+        ax.clear()
+    else:
+        fig, ax = plt.subplots()
+
     search_radius = diag.get("search_radius") if diag else None
     coverage_pct = diag.get("coverage_pct") if diag else None
     gap_pct = diag.get("gap_pct") if diag else None
@@ -109,9 +125,48 @@ def plot_regions(polygons: Dict[int, Polygon], diag: dict | None, block_display:
     ax.grid(True)
     if polygons:
         ax.legend(loc="upper right")
-    plt.show(block=block_display)
-    if not block_display:
-        plt.pause(0.1)
+    if block_display:
+        plt.show(block=True)
+    else:
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+
+    return fig, ax
+
+
+def plot_progress_map(
+    explored_poly: Optional[Polygon],
+    search_radius: Optional[float],
+    summary: Optional[dict],
+    axes: Tuple["plt.Figure", "plt.Axes"],
+) -> None:
+    """Draw the overall coverage progress (explored vs remaining)."""
+
+    fig, ax = axes
+    ax.clear()
+    if not search_radius or search_radius <= 0:
+        ax.set_title("Coverage progress (radius missing)")
+        fig.canvas.draw()
+        fig.canvas.flush_events()
+        return
+
+    circle_poly = Point(0.0, 0.0).buffer(search_radius, resolution=512)
+    _plot_polygon(ax, circle_poly, label="Search area", color="#ddeeff", alpha=0.3)
+
+    if explored_poly and not explored_poly.is_empty:
+        _plot_polygon(ax, explored_poly, label="Explored", color="#888888", alpha=0.5)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    explored_pct = summary["explored_pct"] if summary else 0.0
+    remaining = summary["remaining"] if summary else 0
+    total = summary["total"] if summary else 0
+    explored_cells = total - remaining if total else 0
+    ax.set_title(f"Coverage progress: explored={explored_pct:.2f}% ({explored_cells}/{total} cells)")
+    ax.grid(True)
+    fig.canvas.draw()
+    fig.canvas.flush_events()
 
 
 def log_diagnostics(polygons: Dict[int, Polygon], diag: dict | None, order: Iterable[int]) -> None:
@@ -302,6 +357,7 @@ def run_visualizer(config: VisualizerConfig) -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((config.listen_host, config.listen_port))
+    sock.settimeout(1.0)
     LOGGER.info(
         "Listening for Voronoi cells on %s:%d (expected drones: %s)",
         config.listen_host,
@@ -316,106 +372,166 @@ def run_visualizer(config: VisualizerConfig) -> None:
     latest_radius: float | None = None
     latest_summary: Optional[dict] = None
     latest_explored_poly: Optional[Polygon] = None
+    last_assignment_plot: Optional[float] = None
+    last_progress_plot: Optional[float] = None
+
+    plt.ion()
+    assignment_axes = plt.subplots()
+    progress_axes = plt.subplots()
+
+    def emit_assignment_plot(reason: str) -> bool:
+        nonlocal last_assignment_plot
+        if not polygons:
+            return False
+        order = sorted(current_expected) if current_expected else sorted(polygons.keys())
+        subset = {did: polygons[did] for did in order if did in polygons}
+        if not subset:
+            return False
+        diag = compute_diagnostics(subset, latest_radius, latest_summary, latest_explored_poly)
+        if not diag:
+            return False
+        LOGGER.info("Rendering plot (%s) for drones %s.", reason, order)
+        log_diagnostics(subset, diag, order)
+        plot_regions(subset, diag, block_display=False, axes=assignment_axes)
+        last_assignment_plot = time.time()
+        return True
 
     try:
         while True:
-            data, addr = sock.recvfrom(65535)
+            data = None
+            addr = None
             try:
-                payload = json.loads(data.decode("utf-8"))
-            except json.JSONDecodeError as exc:
-                LOGGER.warning("Failed to decode JSON from %s: %s", addr, exc)
-                continue
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                pass
 
-            msg_type = payload.get("msg_type") or payload.get("type") or ""
-            drone_id = payload.get("drone_id")
-            if drone_id is None:
-                LOGGER.warning("Received payload without drone_id from %s", addr)
-                continue
-
-            polygon: Polygon | None = None
-            plan_id = payload.get("plan_id")
-            dynamic_expected_raw = payload.get("active_ids")
-            dynamic_expected: set[int] | None = None
-            if isinstance(dynamic_expected_raw, list):
+            forced_reason = None
+            if data:
                 try:
-                    dynamic_expected = {int(i) for i in dynamic_expected_raw}
-                except (TypeError, ValueError):
-                    dynamic_expected = None
+                    payload = json.loads(data.decode("utf-8"))
+                except json.JSONDecodeError as exc:
+                    LOGGER.warning("Failed to decode JSON from %s: %s", addr, exc)
+                    payload = None
 
-            if plan_id is not None and plan_id != current_plan_id:
-                LOGGER.info("Starting new assignment batch plan_id=%s", plan_id)
-                polygons.clear()
-                current_plan_id = plan_id
-                current_expected = dynamic_expected or set(static_expected)
-                latest_summary = None
-                latest_explored_poly = None
-            elif dynamic_expected:
-                current_expected = dynamic_expected
-            elif not current_expected and static_expected:
-                current_expected = set(static_expected)
+                if payload:
+                    msg_type = payload.get("msg_type") or payload.get("type") or ""
+                    drone_id = payload.get("drone_id")
+                    if drone_id is None and msg_type != "coverage_snapshot":
+                        LOGGER.warning("Received payload without drone_id from %s", addr)
+                        payload = None
 
-            if msg_type == "voronoi_cell":
-                polygon = _polygon_from_vertices(drone_id, payload)
-                latest_radius = payload.get("search_radius", latest_radius)
-                vertex_count = len(payload.get("vertices_xy") or [])
-                LOGGER.info(
-                    "Received Voronoi cell from drone_id=%s with %d vertices (mode=%s)",
-                    drone_id,
-                    vertex_count,
-                    payload.get("mode"),
-                )
-            elif msg_type == "region_assignment":
-                polygon = _polygon_from_assignment(payload)
-                latest_radius = payload.get("search_radius", latest_radius)
-                latest_summary = payload.get("coverage_summary")
-                latest_explored_poly = _polygon_from_cells(
-                    payload.get("origin_xy"),
-                    payload.get("cell_size"),
-                    payload.get("explored_cells") or [],
-                )
-                LOGGER.info(
-                    "Received region assignment from drone_id=%s with %d cells.",
-                    drone_id,
-                    len(payload.get("cells") or []),
-                )
-            else:
-                LOGGER.debug("Ignoring message with unexpected type '%s' from %s", msg_type, addr)
-                continue
+                if payload:
+                    polygon: Polygon | None = None
+                    plan_id = payload.get("plan_id")
+                    dynamic_expected_raw = payload.get("active_ids")
+                    dynamic_expected: set[int] | None = None
+                    if isinstance(dynamic_expected_raw, list):
+                        try:
+                            dynamic_expected = {int(i) for i in dynamic_expected_raw}
+                        except (TypeError, ValueError):
+                            dynamic_expected = None
 
-            if polygon is None or polygon.is_empty:
-                LOGGER.warning("Polygon for drone %s is empty or invalid; skipping.", drone_id)
-                continue
+                    if plan_id is not None and plan_id != current_plan_id:
+                        LOGGER.info("Starting new assignment batch plan_id=%s", plan_id)
+                        polygons.clear()
+                        current_plan_id = plan_id
+                        current_expected = dynamic_expected or set(static_expected)
+                        latest_summary = None
+                        latest_explored_poly = None
+                        last_plot_time = 0.0
+                    elif dynamic_expected:
+                        current_expected = dynamic_expected
+                    elif not current_expected and static_expected:
+                        current_expected = set(static_expected)
 
-            polygons[drone_id] = polygon
+                    if msg_type == "voronoi_cell":
+                        polygon = _polygon_from_vertices(drone_id, payload)
+                        latest_radius = payload.get("search_radius", latest_radius)
+                        vertex_count = len(payload.get("vertices_xy") or [])
+                        LOGGER.info(
+                            "Received Voronoi cell from drone_id=%s with %d vertices (mode=%s)",
+                            drone_id,
+                            vertex_count,
+                            payload.get("mode"),
+                        )
+                    elif msg_type == "region_assignment":
+                        polygon = _polygon_from_assignment(payload)
+                        latest_radius = payload.get("search_radius", latest_radius)
+                        summary_candidate = payload.get("coverage_summary")
+                        if summary_candidate:
+                            latest_summary = summary_candidate
+                        explored_candidate = payload.get("explored_cells") or None
+                        if explored_candidate:
+                            latest_explored_poly = _polygon_from_cells(
+                                payload.get("origin_xy"),
+                                payload.get("cell_size"),
+                                explored_candidate,
+                            )
+                        LOGGER.info(
+                            "Received region assignment from drone_id=%s with %d cells.",
+                            drone_id,
+                            len(payload.get("cells") or []),
+                        )
+                        forced_reason = "assignment"
+                    elif msg_type == "coverage_snapshot":
+                        latest_summary = payload.get("coverage_summary")
+                        latest_radius = payload.get("search_radius", latest_radius)
+                        latest_explored_poly = _polygon_from_cells(
+                            payload.get("origin_xy"),
+                            payload.get("cell_size"),
+                            payload.get("explored_cells") or [],
+                        )
+                        LOGGER.debug("Received coverage snapshot with %d cells.", len(payload.get("explored_cells") or []))
+                        forced_reason = "coverage"
+                        polygon = None
+                    else:
+                        LOGGER.debug("Ignoring message with unexpected type '%s' from %s", msg_type, addr)
+                        polygon = None
 
-            if current_expected:
-                have_all = current_expected.issubset(polygons.keys())
-            else:
-                have_all = bool(polygons)
-            LOGGER.debug(
-                "Plan %s: collected cells from %s / expected %s",
-                current_plan_id,
-                sorted(polygons.keys()),
-                sorted(current_expected) if current_expected else "any",
-            )
+                    if polygon is not None and not polygon.is_empty:
+                        polygons[drone_id] = polygon
+                        if current_expected:
+                            have_all = current_expected.issubset(polygons.keys())
+                        else:
+                            have_all = bool(polygons)
+                        LOGGER.debug(
+                            "Plan %s: collected cells from %s / expected %s",
+                            current_plan_id,
+                            sorted(polygons.keys()),
+                            sorted(current_expected) if current_expected else "any",
+                        )
+                    else:
+                        polygon = None
 
-            if config.auto_plot and have_all:
-                order = sorted(current_expected) if current_expected else sorted(polygons.keys())
-                subset = {did: polygons[did] for did in order}
-                diag = compute_diagnostics(subset, latest_radius, latest_summary, latest_explored_poly)
-                log_diagnostics(subset, diag, order)
-                plot_regions(subset, diag, block_display=not config.keep_listening)
-                if not config.keep_listening:
+            now = time.time()
+            should_plot = False
+            reason = ""
+            have_all = current_expected.issubset(polygons.keys()) if current_expected else bool(polygons)
+            if forced_reason == "assignment" and config.auto_plot and have_all:
+                should_plot = True
+                reason = "all-assignments"
+
+            progress_due = False
+            if latest_radius is not None:
+                if forced_reason == "coverage":
+                    progress_due = True
+                elif config.plot_interval > 0 and (
+                    last_progress_plot is None or (now - last_progress_plot) >= config.plot_interval
+                ):
+                    progress_due = True
+            if progress_due:
+                plot_progress_map(latest_explored_poly, latest_radius, latest_summary, progress_axes)
+                last_progress_plot = now
+
+            if should_plot and emit_assignment_plot(reason):
+                if not config.keep_listening and reason == "all-assignments":
                     LOGGER.info("All expected cells plotted. Exiting.")
                     break
-                LOGGER.info("Keep-listening enabled â€“ clearing cells for next batch.")
-                polygons.clear()
-                latest_radius = None
-                if plan_id is not None:
-                    current_plan_id = None
-                current_expected = set(static_expected)
     finally:
         sock.close()
+        if not config.keep_listening:
+            plt.ioff()
+            plt.show()
 
 
 def parse_args() -> VisualizerConfig:
@@ -440,6 +556,12 @@ def parse_args() -> VisualizerConfig:
         help="After plotting, continue listening for new batches (default False).",
     )
     parser.add_argument(
+        "--plot-interval",
+        type=float,
+        default=10.0,
+        help="Seconds between periodic map snapshots (0 to disable interval plotting).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -456,6 +578,7 @@ def parse_args() -> VisualizerConfig:
         expected_drones=expected_drones,
         auto_plot=bool(args.auto_plot),
         keep_listening=bool(args.keep_listening),
+        plot_interval=max(0.0, float(args.plot_interval)),
     )
     return config
 

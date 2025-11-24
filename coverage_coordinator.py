@@ -112,6 +112,32 @@ class CoverageCoordinator:
             "explored_pct": pct,
         }
 
+    def _explored_cells_list(self) -> List[List[int]]:
+        cells: List[List[int]] = []
+        for ix in range(self.grid_side):
+            for iy in range(self.grid_side):
+                if self.coverage[ix][iy] and self._cell_inside_circle(ix, iy):
+                    cells.append([ix, iy])
+        return cells
+
+    def _broadcast_coverage_snapshot(self, summary: Dict[str, float]) -> None:
+        if not self.visualizer_port:
+            return
+        payload = {
+            "msg_type": "coverage_snapshot",
+            "origin_xy": list(self.grid_origin),
+            "cell_size": self.cell_size,
+            "explored_cells": self._explored_cells_list(),
+            "coverage_summary": summary,
+            "search_radius": self.search_radius,
+        }
+        try:
+            message = json.dumps(payload).encode("utf-8")
+        except TypeError:
+            return
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message, (self.visualizer_host, self.visualizer_port))
+
     def handle_state_message(self, payload: dict) -> None:
         drone_id = payload.get("drone_id")
         lat = payload.get("lat")
@@ -201,6 +227,7 @@ class CoverageCoordinator:
             )
             if summary["remaining"] == 0:
                 LOGGER.info("All cells explored. Future assignments will be empty until new areas are added.")
+            self._broadcast_coverage_snapshot(summary)
 
     def remove_inactive_drones(self) -> None:
         now = time.time()
@@ -361,7 +388,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 6 coverage coordinator.")
     parser.add_argument("--target-lat", type=float, required=True, help="Target latitude.")
     parser.add_argument("--target-lon", type=float, required=True, help="Target longitude.")
-    parser.add_argument("--search-radius-m", type=float, default=400.0, help="Search radius in meters.")
+    parser.add_argument("--search-radius-m", type=float, default=200.0, help="Search radius in meters.")
     parser.add_argument("--cell-size-m", type=float, default=20.0, help="Grid cell size in meters.")
     parser.add_argument("--failure-timeout", type=float, default=60.0, help="Seconds before a drone is considered failed.")
     parser.add_argument("--replan-interval", type=float, default=0.0, help="Periodic replan interval (0 disables).")
@@ -384,6 +411,7 @@ def parse_args() -> argparse.Namespace:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+
     return args
 
 
