@@ -72,6 +72,7 @@ class CoverageCoordinator:
         self.coverage = [[0 for _ in range(self.grid_side)] for _ in range(self.grid_side)]
         self.explored_cells = 0
         self.drone_plan_ids: Dict[int, int] = {}
+        self.last_snapshot_time = 0.0
 
     def _count_circle_cells(self) -> int:
         count = 0
@@ -228,6 +229,7 @@ class CoverageCoordinator:
             if summary["remaining"] == 0:
                 LOGGER.info("All cells explored. Future assignments will be empty until new areas are added.")
             self._broadcast_coverage_snapshot(summary)
+            self.last_snapshot_time = time.time()
 
     def remove_inactive_drones(self) -> None:
         now = time.time()
@@ -377,6 +379,12 @@ async def main() -> None:
             coordinator.remove_inactive_drones()
             if coordinator.should_replan():
                 await coordinator.run_replan()
+            # periodic coverage snapshot to keep UI alive
+            snapshot_summary = coordinator._coverage_summary()
+            now = time.time()
+            if now - coordinator.last_snapshot_time >= 5.0:
+                coordinator._broadcast_coverage_snapshot(snapshot_summary)
+                coordinator.last_snapshot_time = now
             await asyncio.sleep(1.0)
     except KeyboardInterrupt:
         LOGGER.info("Coordinator stopped by user.")
