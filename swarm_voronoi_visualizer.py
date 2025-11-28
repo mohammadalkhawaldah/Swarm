@@ -27,6 +27,7 @@ from shapely.ops import unary_union
 
 
 LOGGER = logging.getLogger("swarm_voronoi_visualizer")
+DRONE_COLORS = ["#4c78a8", "#f58518", "#54a24b", "#b079a7", "#e45756", "#72b7b2", "#f28e2b", "#ff9da7"]
 
 
 @dataclass
@@ -53,7 +54,7 @@ def parse_expected(expected: str) -> List[int]:
     return sorted(set(ids))
 
 
-def _plot_polygon(ax, poly: Polygon, *, label: Optional[str] = None, color=None, alpha: float = 0.3):
+def _plot_polygon(ax, poly: Polygon, *, label: Optional[str] = None, color=None, alpha: float = 0.35):
     """Helper to draw polygons (including MultiPolygons) with consistent styling."""
 
     if poly.is_empty:
@@ -70,9 +71,15 @@ def _plot_polygon(ax, poly: Polygon, *, label: Optional[str] = None, color=None,
         vertices = list(polygon.exterior.coords)
         xs = [p[0] for p in vertices]
         ys = [p[1] for p in vertices]
-        patch = ax.fill(xs, ys, alpha=alpha, color=face_color, label=label if idx == 0 else None)
+        patch = ax.fill(
+            xs,
+            ys,
+            alpha=alpha,
+            color=face_color,
+            label=label if idx == 0 else None,
+        )
         face_color = face_color or patch[0].get_facecolor()
-        ax.plot(xs, ys, color=face_color, linewidth=1.2)
+        ax.plot(xs, ys, color=face_color, linewidth=2.0)
     return face_color
 
 
@@ -81,6 +88,7 @@ def plot_regions(
     diag: dict | None,
     block_display: bool = True,
     axes: Optional[Tuple["plt.Figure", "plt.Axes"]] = None,
+    explored_overlay: Optional[Polygon] = None,
 ) -> Tuple["plt.Figure", "plt.Axes"]:
     """Plot all Voronoi cells on a shared Matplotlib figure.
 
@@ -99,11 +107,22 @@ def plot_regions(
     gap_pct = diag.get("gap_pct") if diag else None
     overlap_pct = diag.get("overlap_pct") if diag else None
 
+    if explored_overlay and not explored_overlay.is_empty:
+        _plot_polygon(ax, explored_overlay, label="Explored", color="#fdfdfd", alpha=1.0)
+
     for drone_id in sorted(polygons):
         poly = polygons[drone_id]
         if poly.is_empty:
             continue
-        _plot_polygon(ax, poly, label=f"Drone {drone_id}")
+        if explored_overlay and not explored_overlay.is_empty:
+            try:
+                poly = poly.difference(explored_overlay)
+            except Exception:
+                pass
+            if poly.is_empty:
+                continue
+        color = DRONE_COLORS[(drone_id - 1) % len(DRONE_COLORS)]
+        _plot_polygon(ax, poly, label=f"Drone {drone_id}", color=color)
         centroid = (poly.centroid.x, poly.centroid.y)
         area = poly.area
         ax.plot(centroid[0], centroid[1], "ko", markersize=4)
@@ -143,12 +162,12 @@ def plot_progress_map(
     """Draw the overall coverage progress (explored vs remaining)."""
 
     fig, ax = axes
-    ax.clear()
     if not search_radius or search_radius <= 0:
-        ax.set_title("Coverage progress (radius missing)")
+        ax.set_title("Coverage progress (waiting for data)")
         fig.canvas.draw()
         fig.canvas.flush_events()
         return
+    ax.clear()
 
     circle_poly = Point(0.0, 0.0).buffer(search_radius, resolution=512)
     _plot_polygon(ax, circle_poly, label="Search area", color="#ddeeff", alpha=0.3)
@@ -377,22 +396,39 @@ def run_visualizer(config: VisualizerConfig) -> None:
 
     plt.ion()
     assignment_axes = plt.subplots()
+    try:
+        assignment_axes[0].canvas.manager.set_window_title("Voronoi assignments")
+    except Exception:
+        pass
     progress_axes = plt.subplots()
+    try:
+        progress_axes[0].canvas.manager.set_window_title("Coverage progress")
+    except Exception:
+        pass
+    plt.show(block=False)
 
     def emit_assignment_plot(reason: str) -> bool:
         nonlocal last_assignment_plot
         if not polygons:
             return False
-        order = sorted(current_expected) if current_expected else sorted(polygons.keys())
-        subset = {did: polygons[did] for did in order if did in polygons}
-        if not subset:
+        order = sorted(polygons.keys())
+        display_subset: Dict[int, Polygon] = {
+            did: poly for did, poly in polygons.items() if not poly.is_empty
+        }
+        if not display_subset:
             return False
-        diag = compute_diagnostics(subset, latest_radius, latest_summary, latest_explored_poly)
+        diag = compute_diagnostics(display_subset, latest_radius, latest_summary, latest_explored_poly)
         if not diag:
             return False
         LOGGER.info("Rendering plot (%s) for drones %s.", reason, order)
-        log_diagnostics(subset, diag, order)
-        plot_regions(subset, diag, block_display=False, axes=assignment_axes)
+        log_diagnostics(display_subset, diag, order)
+        plot_regions(
+            display_subset,
+            diag,
+            block_display=False,
+            axes=assignment_axes,
+            explored_overlay=latest_explored_poly,
+        )
         last_assignment_plot = time.time()
         return True
 
@@ -438,7 +474,8 @@ def run_visualizer(config: VisualizerConfig) -> None:
                         current_expected = dynamic_expected or set(static_expected)
                         latest_summary = None
                         latest_explored_poly = None
-                        last_plot_time = 0.0
+                        last_assignment_plot = None
+                        last_progress_plot = None
                     elif dynamic_expected:
                         current_expected = dynamic_expected
                     elif not current_expected and static_expected:
@@ -558,7 +595,7 @@ def parse_args() -> VisualizerConfig:
     parser.add_argument(
         "--plot-interval",
         type=float,
-        default=10.0,
+        default=5.0,
         help="Seconds between periodic map snapshots (0 to disable interval plotting).",
     )
     parser.add_argument(

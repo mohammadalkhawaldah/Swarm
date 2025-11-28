@@ -1484,7 +1484,7 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
     parser.add_argument(
         "--initial-loiter-seconds",
         type=float,
-        default=5.0,
+        default=0.0,
         help="Hold time at V-waypoint before Voronoi computation.",
     )
     parser.add_argument(
@@ -1514,7 +1514,7 @@ def parse_args(argv: Optional[list[str]] = None) -> MissionConfig:
     parser.add_argument(
         "--voronoi-wait-seconds",
         type=float,
-        default=10.0,
+        default=3.0,
         help="Max seconds to wait for swarm data before Voronoi.",
     )
     parser.add_argument(
